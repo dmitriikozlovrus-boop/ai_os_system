@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import date, timedelta
 from typing import Any
 
-from .http import request_json, request_multipart
+from .http import HttpError, request_json, request_multipart
 from .models import Classification, classification_from_dict
 
 
@@ -134,13 +136,18 @@ class OpenAIClient:
                 }
             },
         }
-        data = request_json(
-            "POST",
-            "https://api.openai.com/v1/responses",
-            headers={**self.headers, "Content-Type": "application/json"},
-            payload=payload,
-            timeout=90,
-        )
+        try:
+            data = request_json(
+                "POST",
+                "https://api.openai.com/v1/responses",
+                headers={**self.headers, "Content-Type": "application/json"},
+                payload=payload,
+                timeout=90,
+            )
+        except HttpError as exc:
+            if exc.status in {429, 500, 502, 503, 504}:
+                return self._fallback(text, today=today, note=f"fallback classifier after OpenAI HTTP {exc.status}")
+            raise
         raw = _extract_response_text(data)
         return classification_from_dict(json.loads(raw))
 
@@ -156,45 +163,145 @@ class OpenAIClient:
         )
         return str(response.get("text") or "").strip()
 
-    def _fallback(self, text: str) -> Classification:
+    def _fallback(self, text: str, *, today: str | None = None, note: str = "fallback classifier") -> Classification:
         task_words = ("позвон", "напиш", "найти", "посчит", "подготов", "договор", "сдел", "отправ")
         study_words = ("изуч", "разобраться в", "понять", "исслед", "собрать справ")
         lower = text.lower()
-        data: dict[str, Any] = {"tasks": [], "studies": [], "notes": ["fallback classifier"]}
+        data: dict[str, Any] = {"tasks": [], "studies": [], "notes": [note]}
+        task_text, study_text = _split_task_and_study(text)
         if any(word in lower for word in task_words):
+            source = task_text or text
+            project = _extract_after(source, r"по проекту\s+([^,.]+)")
+            area = _extract_after(source, r"направлени[ея]\s+([^,.]+)")
+            due_date = _extract_due_date(source, today)
+            effort_minutes = _extract_minutes(source) or 30
+            desired_result = _extract_after(source, r"Желаемый результат:\s*([^.\n]+)") or (
+                "Понятный выполненный результат по исходному сообщению."
+            )
             data["tasks"].append(
                 {
-                    "title": text[:80],
-                    "description": text,
-                    "desired_result": "Понятный выполненный результат по исходному сообщению.",
-                    "project": None,
-                    "area": None,
-                    "due_date": None,
-                    "effort_minutes": 30,
+                    "title": _clean_title(source, prefixes=("юба, задача:", "люба, задача:", "задача:")),
+                    "description": source,
+                    "desired_result": desired_result,
+                    "project": project,
+                    "area": _normalize_area(area),
+                    "due_date": due_date,
+                    "effort_minutes": effort_minutes,
                     "priority": "P2",
-                    "next_step": "Уточнить проект и срок.",
-                    "confidence": 0.45,
-                    "missing": ["project", "due_date"],
+                    "next_step": _first_sentence(source),
+                    "confidence": 0.75 if project and due_date else 0.45,
+                    "missing": _missing(project=project, area=_normalize_area(area), due_date=due_date),
                 }
             )
         if any(word in lower for word in study_words):
+            source = study_text or text
+            project = _extract_after(source, r"по проекту\s+([^,.]+)")
+            area = _extract_after(source, r"направлени[ея]\s+([^,.]+)")
+            due_date = _extract_due_date(source, today)
             data["studies"].append(
                 {
-                    "question": text[:80],
-                    "description": text,
-                    "industry": "Не определено",
-                    "research_type": "Простое",
-                    "project": None,
-                    "area": None,
+                    "question": _clean_title(source, prefixes=("и на изучение:", "на изучение:")),
+                    "description": source,
+                    "industry": _guess_industry(source),
+                    "research_type": "Глубокое" if "подроб" in source.lower() or "глубок" in source.lower() else "Простое",
+                    "project": project,
+                    "area": _normalize_area(area),
                     "priority": "P2",
-                    "result_format": "Краткая справка",
-                    "due_date": None,
+                    "result_format": "Подробная справка" if "подроб" in source.lower() else "Краткая справка",
+                    "due_date": due_date,
                     "source": "Telegram",
-                    "confidence": 0.45,
-                    "missing": ["project", "due_date"],
+                    "confidence": 0.75 if project and due_date else 0.45,
+                    "missing": _missing(project=project, area=_normalize_area(area), due_date=due_date),
                 }
             )
         return classification_from_dict(data)
+
+
+def _split_task_and_study(text: str) -> tuple[str, str]:
+    marker = re.search(r"\b(?:и\s+)?на изучение\s*:", text, flags=re.IGNORECASE)
+    if not marker:
+        return text, ""
+    return text[: marker.start()].strip(), text[marker.start() :].strip()
+
+
+def _extract_after(text: str, pattern: str) -> str | None:
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else None
+
+
+def _extract_minutes(text: str) -> int | None:
+    match = re.search(r"(\d+)\s*(?:минут|мин|м\b)", text, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _extract_due_date(text: str, today: str | None) -> str | None:
+    if not today:
+        return None
+    base = date.fromisoformat(today)
+    lower = text.lower()
+    if "послезавтра" in lower:
+        return (base + timedelta(days=2)).isoformat()
+    if "завтра" in lower:
+        return (base + timedelta(days=1)).isoformat()
+    weekdays = {
+        "понедельник": 0,
+        "вторник": 1,
+        "сред": 2,
+        "четверг": 3,
+        "пятниц": 4,
+        "суббот": 5,
+        "воскрес": 6,
+    }
+    for word, weekday in weekdays.items():
+        if word in lower:
+            delta = (weekday - base.weekday()) % 7
+            return (base + timedelta(days=delta or 7)).isoformat()
+    match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    return match.group(1) if match else None
+
+
+def _normalize_area(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = value.strip().capitalize()
+    aliases = {"Личное": "Личное развитие"}
+    return aliases.get(cleaned, cleaned)
+
+
+def _missing(*, project: str | None, area: str | None, due_date: str | None) -> list[str]:
+    missing = []
+    if not project:
+        missing.append("project")
+    if not area:
+        missing.append("area")
+    if not due_date:
+        missing.append("due_date")
+    return missing
+
+
+def _clean_title(text: str, *, prefixes: tuple[str, ...]) -> str:
+    value = text.strip()
+    lower = value.lower()
+    for prefix in prefixes:
+        if lower.startswith(prefix):
+            value = value[len(prefix) :].strip()
+            break
+    return _first_sentence(value)[:120]
+
+
+def _first_sentence(text: str) -> str:
+    return re.split(r"(?<=[.!?])\s+", text.strip(), maxsplit=1)[0][:200]
+
+
+def _guess_industry(text: str) -> str:
+    lower = text.lower()
+    if "логист" in lower or "веракрус" in lower:
+        return "Логистика"
+    if "алюмин" in lower or "сыр" in lower:
+        return "Сырьевые товары"
+    if "ai" in lower or "ии" in lower:
+        return "AI"
+    return "Не определено"
 
 
 def _extract_response_text(data: dict[str, Any]) -> str:
