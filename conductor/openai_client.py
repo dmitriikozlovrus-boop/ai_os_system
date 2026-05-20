@@ -164,7 +164,7 @@ class OpenAIClient:
         return str(response.get("text") or "").strip()
 
     def _fallback(self, text: str, *, today: str | None = None, note: str = "fallback classifier") -> Classification:
-        task_words = ("позвон", "напиш", "найти", "посчит", "подготов", "договор", "сдел", "отправ")
+        task_words = ("позвон", "напиш", "напис", "найти", "посчит", "подготов", "договор", "сдел", "отправ")
         study_words = ("изуч", "разобраться в", "понять", "исслед", "собрать справ")
         lower = text.lower()
         data: dict[str, Any] = {"tasks": [], "studies": [], "notes": [note]}
