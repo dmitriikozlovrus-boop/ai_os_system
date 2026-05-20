@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: conductor-luba
+    env: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 8080
+      - key: TIMEZONE
+        value: America/Mexico_City
+      - key: CONFIDENCE_THRESHOLD
+        value: 0.70
+      - key: PENDING_STORE_PATH
+        value: data/pending.json
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_TRANSCRIBE_MODEL
+        value: gpt-4o-mini-transcribe
+      - key: TODOIST_ENABLED
+        value: false
+      - key: NOTION_TASKS_DATABASE_ID
+        value: be9d26fe652b474696cd5de0118b1210
+      - key: NOTION_STUDY_DATABASE_ID
+        value: 4e27e10ca2bf44a08b4c8f86c7a125bd
+      - key: NOTION_PROJECTS_DATABASE_ID
+        value: bbb501a6933941b4837afff250479f0e
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: NOTION_TOKEN
+        sync: false
+      - key: TODOIST_API_TOKEN
+        sync: false
