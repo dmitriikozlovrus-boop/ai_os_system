@@ -117,6 +117,7 @@ class OpenAIClient:
             "- Если срок не указан, поставь due_date=null и добавь 'due_date' в missing.\n"
             "- Если уверенность по проекту/типу/сроку ниже 0.70, добавь соответствующее поле в missing.\n"
             "- В title задачи не включай проект, направление, срок, оценку времени и желаемый результат; title = только короткое действие.\n"
+            "- Title задачи всегда начинай с большой буквы.\n"
             "- В question вопроса на изучение не включай проект, направление, срок и формат результата; question = только суть изучения.\n"
             "- Расширяй описание так, чтобы через месяц было понятно, что сделать и зачем.\n"
             "- Даты возвращай ISO YYYY-MM-DD. Сегодня: " + today + ".\n"
@@ -289,7 +290,7 @@ def _clean_title(text: str, *, prefixes: tuple[str, ...], kind: str = "generic")
             value = value[len(prefix) :].strip()
             break
     value = _strip_metadata_from_title(value, kind=kind)
-    return _first_sentence(value)[:120]
+    return _capitalize_first_letter(_first_sentence(value)[:120])
 
 
 def _strip_metadata_from_title(text: str, *, kind: str) -> str:
@@ -312,6 +313,13 @@ def _strip_metadata_from_title(text: str, *, kind: str) -> str:
 
 def _first_sentence(text: str) -> str:
     return re.split(r"(?<=[.!?])\s+", text.strip(), maxsplit=1)[0][:200]
+
+
+def _capitalize_first_letter(text: str) -> str:
+    for index, char in enumerate(text):
+        if char.isalpha():
+            return text[:index] + char.upper() + text[index + 1 :]
+    return text
 
 
 def _guess_industry(text: str) -> str:

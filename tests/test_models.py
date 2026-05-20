@@ -43,7 +43,7 @@ class ModelsTest(unittest.TestCase):
             "направление Бизнес. Оценка 15 минут. Желаемый результат: понять следующий шаг.",
             today="2026-05-20",
         )
-        self.assertEqual(result.tasks[0].title, "написать Марко по алюминию")
+        self.assertEqual(result.tasks[0].title, "Написать Марко по алюминию")
         self.assertEqual(result.tasks[0].project, "Сырьевой трейдинг")
         self.assertEqual(result.tasks[0].area, "Бизнес")
         self.assertEqual(result.tasks[0].due_date, "2026-05-21")
@@ -55,7 +55,7 @@ class ModelsTest(unittest.TestCase):
             "по проекту Базовые масла, направление Бизнес. Нужна подробная справка.",
             today="2026-05-20",
         )
-        self.assertEqual(result.studies[0].question, "изучить доступные логистические пути через Веракрус")
+        self.assertEqual(result.studies[0].question, "Изучить доступные логистические пути через Веракрус")
         self.assertEqual(result.studies[0].project, "Базовые масла")
 
 
