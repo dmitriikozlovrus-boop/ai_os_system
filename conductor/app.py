@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -29,11 +30,16 @@ class Handler(BaseHTTPRequestHandler):
             if got != settings.telegram_webhook_secret:
                 self._json(401, {"error": "bad secret"})
                 return
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8")
-        update = json.loads(body)
-        result = handle_update(update)
-        self._json(200, result)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8")
+            update = json.loads(body)
+            result = handle_update(update)
+            self._json(200, result)
+        except Exception as exc:  # noqa: BLE001 - Telegram must get a response, not a dropped connection.
+            print("Unhandled webhook error:", repr(exc), flush=True)
+            traceback.print_exc()
+            self._json(200, {"ok": False, "error": str(exc)})
 
     def log_message(self, format: str, *args: Any) -> None:
         return

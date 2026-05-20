@@ -32,8 +32,17 @@ class ConductorService:
             if pending:
                 _, pending_item = pending
                 text = _merge_pending_text(pending_item, text)
-        projects = self.notion.list_projects()
-        classification = self.openai.classify(text, projects=projects, today=date.today().isoformat())
+        try:
+            projects = self.notion.list_projects()
+        except Exception as exc:  # noqa: BLE001 - missing project context should not break capture.
+            projects = []
+            print(f"Could not load Notion projects: {exc}", flush=True)
+        try:
+            classification = self.openai.classify(text, projects=projects, today=date.today().isoformat())
+        except Exception as exc:  # noqa: BLE001 - notify the user instead of returning a webhook 502.
+            if chat_id is not None:
+                self.telegram.send_message(chat_id, f"Не смог разобрать сообщение через AI: {exc}")
+            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
         return self._handle_classification(classification, chat_id=chat_id, source=source)
 
     def process_audio(
