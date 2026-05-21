@@ -102,7 +102,7 @@ class OpenAIClient:
 
     def classify(self, text: str, *, projects: list[dict[str, str]], today: str) -> Classification:
         if not self.api_key:
-            return self._fallback(text)
+            return self._fallback(text, today=today, projects=projects)
 
         project_lines = "\n".join(
             f"- {p.get('name')} | направление: {p.get('area') or 'не указано'} | статус: {p.get('status') or 'не указано'}"
@@ -155,10 +155,16 @@ class OpenAIClient:
             )
         except HttpError as exc:
             if exc.status in {429, 500, 502, 503, 504}:
-                return self._fallback(text, today=today, note=f"fallback classifier after OpenAI HTTP {exc.status}")
+                return self._fallback(
+                    text,
+                    today=today,
+                    projects=projects,
+                    note=f"fallback classifier after OpenAI HTTP {exc.status}",
+                )
             raise
         raw = _extract_response_text(data)
-        return classification_from_dict(json.loads(raw))
+        classification = classification_from_dict(json.loads(raw))
+        return _postprocess_classification(classification, projects=projects)
 
     def transcribe(self, filename: str, data: bytes, content_type: str = "audio/ogg") -> str:
         if not self.api_key:
@@ -172,7 +178,14 @@ class OpenAIClient:
         )
         return str(response.get("text") or "").strip()
 
-    def _fallback(self, text: str, *, today: str | None = None, note: str = "fallback classifier") -> Classification:
+    def _fallback(
+        self,
+        text: str,
+        *,
+        today: str | None = None,
+        projects: list[dict[str, str]] | None = None,
+        note: str = "fallback classifier",
+    ) -> Classification:
         task_words = ("позвон", "напиш", "напис", "найти", "посчит", "подготов", "договор", "сдел", "отправ")
         study_words = ("изуч", "разобраться в", "исслед", "собрать справ")
         lower = text.lower()
@@ -222,7 +235,8 @@ class OpenAIClient:
                     "missing": _missing(project=project, area=_normalize_area(area), due_date=due_date),
                 }
             )
-        return classification_from_dict(data)
+        classification = classification_from_dict(data)
+        return _postprocess_classification(classification, projects=projects or [])
 
 
 def _split_task_and_study(text: str) -> tuple[str, str]:
@@ -381,3 +395,70 @@ def _extract_response_text(data: dict[str, Any]) -> str:
     if parts:
         return "".join(parts)
     raise RuntimeError(f"Could not extract text from OpenAI response: {data}")
+
+
+def _postprocess_classification(classification: Classification, *, projects: list[dict[str, str]]) -> Classification:
+    project_map = {
+        str(project.get("name") or "").strip().casefold(): project
+        for project in projects
+        if str(project.get("name") or "").strip()
+    }
+
+    for item in classification.tasks:
+        item.title = _clean_title(item.title or item.description, prefixes=(), kind="task")
+        item.desired_result = item.desired_result or _infer_desired_result(item.description or item.title)
+        item.area = _normalize_area(item.area)
+        matched_project = _match_project(item.project, project_map)
+        if matched_project:
+            item.project = matched_project["name"]
+            if not item.area:
+                item.area = _normalize_area(matched_project.get("area"))
+        elif item.project and project_map:
+            item.project = None
+            _ensure_missing(item.missing, "project")
+        _ensure_missing(item.missing, "due_date", when=not item.due_date)
+        _ensure_missing(item.missing, "project", when=not item.project)
+        _ensure_missing(item.missing, "area", when=not item.area)
+
+    for item in classification.studies:
+        item.question = _clean_title(item.question or item.description, prefixes=(), kind="study")
+        item.industry = item.industry or _guess_industry(item.description or item.question)
+        item.research_type = item.research_type if item.research_type in {"Простое", "Глубокое"} else "Простое"
+        if item.result_format not in RESULT_FORMAT_HINTS:
+            item.result_format = "Подробная справка" if item.research_type == "Глубокое" else "Краткая справка"
+        if item.research_type == "Простое" and item.result_format == "Подробная справка":
+            item.result_format = "Краткая справка"
+        if item.research_type == "Глубокое" and item.result_format == "Краткая справка":
+            item.result_format = "Подробная справка"
+        item.area = _normalize_area(item.area)
+        matched_project = _match_project(item.project, project_map)
+        if matched_project:
+            item.project = matched_project["name"]
+            if not item.area:
+                item.area = _normalize_area(matched_project.get("area"))
+        elif item.project and project_map:
+            item.project = None
+            _ensure_missing(item.missing, "project")
+        _ensure_missing(item.missing, "due_date", when=not item.due_date)
+        _ensure_missing(item.missing, "project", when=not item.project)
+        _ensure_missing(item.missing, "area", when=not item.area)
+
+    return classification
+
+
+RESULT_FORMAT_HINTS = {"Краткая справка", "Подробная справка", "Memo", "Таблица", "Telegram-дайджест"}
+
+
+def _match_project(value: str | None, project_map: dict[str, dict[str, str]]) -> dict[str, str] | None:
+    if not value:
+        return None
+    return project_map.get(value.strip().casefold())
+
+
+def _ensure_missing(missing: list[str], field: str, *, when: bool = True) -> None:
+    if when:
+        if field not in missing:
+            missing.append(field)
+        return
+    if field in missing:
+        missing[:] = [value for value in missing if value != field]

@@ -72,6 +72,28 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result.studies[0].research_type, "Простое")
         self.assertEqual(result.studies[0].result_format, "Краткая справка")
 
+    def test_postprocess_normalizes_project_name_and_area_from_catalog(self):
+        client = OpenAIClient("", "unused", "unused")
+        result = client._fallback(
+            "Люба, задача: завтра написать Марко по проекту сырьевой трейдинг.",
+            today="2026-05-20",
+            projects=[{"name": "СЫРЬЕВОЙ ТРЕЙДИНГ", "area": "Бизнес", "status": "Active"}],
+        )
+        self.assertEqual(result.tasks[0].project, "СЫРЬЕВОЙ ТРЕЙДИНГ")
+        self.assertEqual(result.tasks[0].area, "Бизнес")
+        self.assertNotIn("project", result.tasks[0].missing)
+        self.assertNotIn("area", result.tasks[0].missing)
+
+    def test_postprocess_clears_unknown_project_when_catalog_exists(self):
+        client = OpenAIClient("", "unused", "unused")
+        result = client._fallback(
+            "Люба, задача: завтра написать Марко по проекту неизвестный проект, направление Бизнес.",
+            today="2026-05-20",
+            projects=[{"name": "СЫРЬЕВОЙ ТРЕЙДИНГ", "area": "Бизнес", "status": "Active"}],
+        )
+        self.assertIsNone(result.tasks[0].project)
+        self.assertIn("project", result.tasks[0].missing)
+
     def test_clarification_fallback_uses_obshchee_project(self):
         classification = classification_from_dict(
             {
