@@ -202,7 +202,7 @@ class OpenAIClient:
         projects: list[dict[str, str]] | None = None,
         note: str = "fallback classifier",
     ) -> Classification:
-        task_words = ("позвон", "напиш", "напис", "найти", "посчит", "подготов", "договор", "сдел", "отправ")
+        task_words = ("позвон", "напиш", "напис", "найти", "посчит", "подготов", "договор", "сдел", "отправ", "напом")
         study_words = ("изуч", "разобраться в", "исслед", "собрать справ")
         lower = text.lower()
         data: dict[str, Any] = {"tasks": [], "studies": [], "notes": [note]}
@@ -382,6 +382,8 @@ def _infer_effort_minutes(text: str) -> int:
 
 def _infer_desired_result(text: str) -> str:
     lower = text.lower()
+    if "рожд" in lower and ("напом" in lower or "поздрав" in lower):
+        return "Совершенное поздравление"
     if "позвон" in lower:
         return "Совершенный звонок"
     if "напис" in lower or "отправ" in lower:
@@ -422,6 +424,7 @@ def _postprocess_classification(classification: Classification, *, projects: lis
 
     for item in classification.tasks:
         item.title = _clean_title(item.title or item.description, prefixes=(), kind="task")
+        item.title = _normalize_birthday_task_title(item.title, item.description)
         item.desired_result = item.desired_result or _infer_desired_result(item.description or item.title)
         item.area = _normalize_area(item.area)
         matched_project = _match_project(item.project, project_map)
@@ -478,3 +481,23 @@ def _ensure_missing(missing: list[str], field: str, *, when: bool = True) -> Non
         return
     if field in missing:
         missing[:] = [value for value in missing if value != field]
+
+
+def _normalize_birthday_task_title(title: str, description: str) -> str:
+    combined = f"{title} {description}".lower()
+    if "рожд" not in combined:
+        return title
+    normalized = title.strip()
+    lower = normalized.lower()
+    for prefix in ("завтра ", "сегодня ", "послезавтра "):
+        if lower.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            lower = normalized.lower()
+            break
+    if lower.startswith("напомнить "):
+        normalized = "Поздравить " + normalized[len("напомнить ") :]
+    elif lower.startswith("напомни "):
+        normalized = "Поздравить " + normalized[len("напомни ") :]
+    normalized = re.sub(r"\bо дне рождения\b", "с днем рождения", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bпро день рождения\b", "с днем рождения", normalized, flags=re.IGNORECASE)
+    return _capitalize_first_letter(normalized.strip())

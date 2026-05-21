@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 from conductor.models import classification_from_dict, normalize_effort
 from conductor.openai_client import OpenAIClient
-from conductor.service import ConductorService, _apply_clarification_fallbacks, _resolve_pending_without_ai
+from conductor.service import ConductorService, _apply_clarification_fallbacks, _format_created_summary, _resolve_pending_without_ai
 
 
 class ModelsTest(unittest.TestCase):
@@ -132,7 +132,7 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result["tasks_created"], [])
         self.assertEqual(result["studies_created"], [])
         self.assertIn("insufficient_quota", result["errors"][0])
-        self.assertEqual(service.telegram.send_message.call_count, 2)
+        self.assertEqual(service.telegram.send_message.call_count, 1)
         self.assertIn("Не смогла расшифровать голосовое", service.telegram.send_message.call_args.args[1])
 
     def test_transcribe_uses_fallback_model(self):
@@ -173,6 +173,44 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result.tasks[0].due_date, "2026-05-21")
         self.assertEqual(result.tasks[0].missing, [])
         self.assertGreaterEqual(result.tasks[0].confidence, 0.85)
+
+    def test_created_summary_uses_explicit_multiline_format(self):
+        classification = classification_from_dict(
+            {
+                "tasks": [
+                    {
+                        "title": "Написать Марко",
+                        "description": "Написать Марко по алюминию",
+                        "desired_result": "Отправленное письмо",
+                        "project": "СЫРЬЕВОЙ ТРЕЙДИНГ",
+                        "area": "Бизнес",
+                        "due_date": "2026-05-21",
+                        "effort_minutes": 15,
+                        "priority": "P2",
+                        "next_step": "Написать Марко",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "studies": [],
+                "notes": [],
+            }
+        )
+        message = _format_created_summary(classification)
+        self.assertIn("Добавила задачу: Написать Марко", message)
+        self.assertIn("Направление: Бизнес", message)
+        self.assertIn("Проект: СЫРЬЕВОЙ ТРЕЙДИНГ", message)
+        self.assertIn("Дата исполнения: 2026-05-21", message)
+        self.assertIn("Длительность работы: 15 минут", message)
+
+    def test_birthday_reminder_turns_into_congratulation(self):
+        client = OpenAIClient("", "unused", "unused")
+        result = client._fallback(
+            "Люба, задача: завтра напомни о дне рождения Марии по проекту Семья, направление Семья.",
+            today="2026-05-20",
+        )
+        self.assertEqual(result.tasks[0].title, "Поздравить с днем рождения Марии")
+        self.assertEqual(result.tasks[0].desired_result, "Совершенное поздравление")
 
 
 if __name__ == "__main__":

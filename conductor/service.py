@@ -76,8 +76,6 @@ class ConductorService:
         chat_id: int | None = None,
         source: str = "Telegram voice",
     ) -> dict[str, Any]:
-        if chat_id is not None:
-            self.telegram.send_message(chat_id, "Приняла голосовое. Расшифровываю и раскладываю по базам.")
         try:
             text = self.openai.transcribe(filename, data, content_type)
         except Exception as exc:  # noqa: BLE001 - voice failures should be visible to the user.
@@ -179,12 +177,25 @@ def _format_created_summary(classification: Classification, *, from_clarificatio
     if from_clarification:
         lines.append("Зафиксировала после уточнения:")
     for item in classification.tasks:
-        due = item.due_date or "без срока"
-        effort = f"{item.effort_minutes} мин" if item.effort_minutes else "без оценки"
-        lines.append(f"Добавила задачу: {item.title} ({due}, {effort})")
+        lines.extend(
+            [
+                f"Добавила задачу: {item.title}",
+                f"Направление: {item.area or 'Не указано'}",
+                f"Проект: {item.project or 'Не указано'}",
+                f"Дата исполнения: {item.due_date or 'Не указана'}",
+                f"Длительность работы: {item.effort_minutes} минут" if item.effort_minutes else "Длительность работы: Не указана",
+            ]
+        )
     for item in classification.studies:
-        lines.append(
-            f"Добавила на изучение: {item.question} ({item.research_type.lower()}, {item.result_format.lower()})"
+        lines.extend(
+            [
+                f"Добавила на изучение: {item.question}",
+                f"Направление: {item.area or 'Не указано'}",
+                f"Проект: {item.project or 'Не указано'}",
+                f"Дата исполнения: {item.due_date or 'Не указана'}",
+                f"Тип исследования: {item.research_type}",
+                f"Формат результата: {item.result_format}",
+            ]
         )
     lines.append("Если что-то не так, напиши одним сообщением, что изменить.")
     return "\n".join(lines)
