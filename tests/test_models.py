@@ -3,7 +3,13 @@ from unittest.mock import Mock, patch
 
 from conductor.models import classification_from_dict, normalize_effort
 from conductor.openai_client import OpenAIClient
-from conductor.service import ConductorService, _apply_clarification_fallbacks, _format_created_summary, _resolve_pending_without_ai
+from conductor.service import (
+    ConductorService,
+    _apply_clarification_fallbacks,
+    _apply_edit_to_recent,
+    _format_created_summary,
+    _resolve_pending_without_ai,
+)
 
 
 class ModelsTest(unittest.TestCase):
@@ -178,13 +184,38 @@ class ModelsTest(unittest.TestCase):
         service = object.__new__(ConductorService)
         service.pending = Mock()
         service.pending.pop_oldest_for_chat.return_value = None
+        service.recent = Mock()
+        service.recent.get.return_value = None
         service.telegram = Mock()
 
         result = service.process_text("Поправь", chat_id=42)
 
         self.assertEqual(result["notes"], ["edit guidance sent"])
         service.telegram.send_message.assert_called_once()
-        self.assertIn("Пока я не умею править уже сохраненную запись", service.telegram.send_message.call_args.args[1])
+        self.assertIn("Не поняла, что именно нужно поправить", service.telegram.send_message.call_args.args[1])
+
+    def test_apply_edit_to_recent_updates_due_date(self):
+        recent = {
+            "type": "task",
+            "url": "https://www.notion.so/test-12345678123412341234123456789012",
+            "page_id": "12345678-1234-1234-1234-123456789012",
+            "item": {
+                "title": "Написать Марко",
+                "description": "Написать Марко по алюминию",
+                "desired_result": "Отправленное письмо",
+                "project": "СЫРЬЕВОЙ ТРЕЙДИНГ",
+                "area": "Бизнес",
+                "due_date": "2026-05-21",
+                "effort_minutes": 15,
+                "priority": "P2",
+                "next_step": "Написать Марко",
+                "confidence": 0.9,
+                "missing": [],
+            },
+        }
+        updated = _apply_edit_to_recent(recent, "Исправь срок на пятницу", today="2026-05-20", projects=[])
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated["item"]["due_date"], "2026-05-22")
 
     def test_created_summary_uses_explicit_multiline_format(self):
         classification = classification_from_dict(

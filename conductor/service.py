@@ -8,6 +8,7 @@ from .models import Classification, StudyItem, TaskItem
 from .notion_client import NotionClient
 from .openai_client import OpenAIClient, _extract_due_date, _normalize_area
 from .pending import PendingStore
+from .recent import RecentStore
 from .telegram import TelegramClient
 from .todoist_client import TodoistClient
 
@@ -30,6 +31,7 @@ class ConductorService:
         self.telegram = TelegramClient(settings.telegram_bot_token)
         self.todoist = TodoistClient(settings.todoist_api_token, settings.todoist_enabled)
         self.pending = PendingStore(settings.pending_store_path)
+        self.recent = RecentStore(settings.recent_store_path)
 
     def process_text(self, text: str, *, chat_id: int | None = None, source: str = "Telegram") -> dict[str, Any]:
         pending_item: dict[str, Any] | None = None
@@ -38,8 +40,7 @@ class ConductorService:
             if pending:
                 _, pending_item = pending
         if chat_id is not None and not pending_item and _looks_like_edit_request(text):
-            self.telegram.send_message(chat_id, _edit_guidance_message())
-            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
+            return self._handle_edit_request(text, chat_id=chat_id)
         try:
             projects = self.notion.list_projects()
         except Exception as exc:  # noqa: BLE001 - missing project context should not break capture.
@@ -92,6 +93,38 @@ class ConductorService:
         result["transcript"] = text
         return result
 
+    def _handle_edit_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        recent = self.recent.get(chat_id)
+        if not recent:
+            self.telegram.send_message(chat_id, _edit_guidance_message())
+            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
+        try:
+            projects = self.notion.list_projects()
+        except Exception as exc:  # noqa: BLE001
+            projects = []
+            print(f"Could not load Notion projects: {exc}", flush=True)
+
+        updated = _apply_edit_to_recent(recent, text, today=date.today().isoformat(), projects=projects)
+        if not updated:
+            self.telegram.send_message(chat_id, _edit_guidance_message())
+            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
+
+        try:
+            if updated["type"] == "task":
+                item = TaskItem(**updated["item"])
+                self.notion.update_task(updated["page_id"], item)
+                classification = Classification(tasks=[item], studies=[], notes=["edited recent task"])
+            else:
+                item = StudyItem(**updated["item"])
+                self.notion.update_study(updated["page_id"], item)
+                classification = Classification(tasks=[], studies=[item], notes=["edited recent study"])
+        except Exception as exc:  # noqa: BLE001
+            self.telegram.send_message(chat_id, f"Не смогла обновить запись: {exc}")
+            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [str(exc)], "notes": ["edit failed"]}
+        self.recent.save(chat_id, updated)
+        self.telegram.send_message(chat_id, _format_updated_summary(classification))
+        return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [], "notes": classification.notes}
+
     def _handle_classification(
         self,
         classification: Classification,
@@ -115,6 +148,8 @@ class ConductorService:
             try:
                 url = self.notion.create_task(item, source=source)
                 created_tasks.append(url)
+                if chat_id is not None:
+                    self.recent.save(chat_id, _recent_payload("task", url, item.__dict__))
                 self.todoist.create_task(item)
             except Exception as exc:  # noqa: BLE001 - notify user rather than hide automation failures.
                 errors.append(f"Не удалось создать задачу '{item.title}': {exc}")
@@ -127,7 +162,10 @@ class ConductorService:
                 self.telegram.send_message(chat_id, _format_questions(item.question, questions))
                 continue
             try:
-                created_studies.append(self.notion.create_study(item))
+                url = self.notion.create_study(item)
+                created_studies.append(url)
+                if chat_id is not None:
+                    self.recent.save(chat_id, _recent_payload("study", url, item.__dict__))
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"Не удалось создать вопрос на изучение '{item.question}': {exc}")
 
@@ -177,14 +215,13 @@ def _format_questions(title: str, questions: list[str]) -> str:
 
 def _edit_guidance_message() -> str:
     return (
-        "Пока я не умею править уже сохраненную запись по слову 'поправь' автоматически.\n\n"
-        "Пришли одной фразой готовую правку целиком, например:\n"
-        "Исправь задачу: Написать Марко\n"
-        "Направление: Бизнес\n"
-        "Проект: СЫРЬЕВОЙ ТРЕЙДИНГ\n"
-        "Дата исполнения: 2026-05-22\n"
-        "Длительность работы: 15 минут\n\n"
-        "Или просто отправь задачу заново в правильном виде, а я зафиксирую ее как новую."
+        "Не поняла, что именно нужно поправить.\n\n"
+        "Можно написать так:\n"
+        "- Исправь срок на пятницу\n"
+        "- Исправь проект на СЫРЬЕВОЙ ТРЕЙДИНГ\n"
+        "- Исправь направление на Бизнес\n"
+        "- Исправь длительность на 15 минут\n"
+        "- Исправь название на Поздравить с днем рождения Марии"
     )
 
 
@@ -214,6 +251,32 @@ def _format_created_summary(classification: Classification, *, from_clarificatio
             ]
         )
     lines.append("Если что-то не так, напиши одним сообщением, что изменить.")
+    return "\n".join(lines)
+
+
+def _format_updated_summary(classification: Classification) -> str:
+    lines = ["Обновила запись:"]
+    for item in classification.tasks:
+        lines.extend(
+            [
+                f"Задача: {item.title}",
+                f"Направление: {item.area or 'Не указано'}",
+                f"Проект: {item.project or 'Не указано'}",
+                f"Дата исполнения: {item.due_date or 'Не указана'}",
+                f"Длительность работы: {item.effort_minutes} минут" if item.effort_minutes else "Длительность работы: Не указана",
+            ]
+        )
+    for item in classification.studies:
+        lines.extend(
+            [
+                f"На изучение: {item.question}",
+                f"Направление: {item.area or 'Не указано'}",
+                f"Проект: {item.project or 'Не указано'}",
+                f"Дата исполнения: {item.due_date or 'Не указана'}",
+                f"Тип исследования: {item.research_type}",
+                f"Формат результата: {item.result_format}",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -331,3 +394,117 @@ def _extract_area_from_answer(answer: str) -> str | None:
 def _looks_like_edit_request(text: str) -> bool:
     lower = text.strip().casefold()
     return lower.startswith(("поправь", "исправь", "измени", "не так", "неправильно"))
+
+
+def _recent_payload(item_type: str, url: str, item: dict[str, Any]) -> dict[str, Any]:
+    return {"type": item_type, "url": url, "page_id": _extract_notion_page_id(url), "item": item}
+
+
+def _extract_notion_page_id(url: str) -> str:
+    raw = url.rstrip("/").split("-")[-1].split("?")[0]
+    if len(raw) == 32:
+        return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+    return raw
+
+
+def _apply_edit_to_recent(
+    recent: dict[str, Any],
+    text: str,
+    *,
+    today: str,
+    projects: list[dict[str, str]],
+) -> dict[str, Any] | None:
+    item_type = recent.get("type")
+    if item_type not in {"task", "study"}:
+        return None
+    updated = {
+        "type": recent["type"],
+        "url": recent["url"],
+        "page_id": recent["page_id"],
+        "item": dict(recent["item"]),
+    }
+    item = updated["item"]
+    changed = False
+
+    title = _extract_replacement_value(text, ("название", "задачу", "задача", "вопрос", "на изучение"))
+    if title:
+        key = "title" if item_type == "task" else "question"
+        item[key] = title
+        changed = True
+
+    project_name = _extract_project_from_answer(text, projects)
+    if project_name:
+        item["project"] = project_name
+        changed = True
+
+    area = _extract_area_from_answer(text)
+    if area:
+        item["area"] = area
+        changed = True
+
+    due_date = _extract_due_date(text, today)
+    if due_date:
+        item["due_date"] = due_date
+        changed = True
+
+    effort = _extract_effort_from_answer(text)
+    if effort is not None and item_type == "task":
+        item["effort_minutes"] = effort
+        changed = True
+
+    if item_type == "study":
+        research_type = _extract_research_type(text)
+        if research_type:
+            item["research_type"] = research_type
+            item["result_format"] = "Подробная справка" if research_type == "Глубокое" else "Краткая справка"
+            changed = True
+
+    if item_type == "task" and _looks_like_birthday_correction(text):
+        current_title = str(item.get("title") or "")
+        current_title = current_title.replace("Напомнить", "Поздравить").replace("напомнить", "Поздравить")
+        current_title = current_title.replace("Напомни", "Поздравить").replace("напомни", "Поздравить")
+        current_title = current_title.replace("о дне рождения", "с днем рождения")
+        item["title"] = current_title
+        item["desired_result"] = "Совершенное поздравление"
+        changed = True
+
+    if not changed:
+        return None
+    return updated
+
+
+def _extract_replacement_value(text: str, markers: tuple[str, ...]) -> str | None:
+    lower = text.casefold()
+    for marker in markers:
+        for pattern in (f"{marker} на ", f"{marker}:"):
+            index = lower.find(pattern)
+            if index != -1:
+                return text[index + len(pattern) :].strip(" .:\n\t")
+    return None
+
+
+def _extract_effort_from_answer(text: str) -> int | None:
+    import re
+
+    lower = text.casefold()
+    match = re.search(r"(\d+)\s*(час|часа|часов)", lower)
+    if match:
+        return int(match.group(1)) * 60
+    match = re.search(r"(\d+)\s*(минут|мин|м\b)", lower)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_research_type(text: str) -> str | None:
+    lower = text.casefold()
+    if "глубок" in lower or "подроб" in lower:
+        return "Глубокое"
+    if "прост" in lower or "кратк" in lower:
+        return "Простое"
+    return None
+
+
+def _looks_like_birthday_correction(text: str) -> bool:
+    lower = text.casefold()
+    return "поздрав" in lower and "рожд" in lower

@@ -42,6 +42,7 @@ class Settings:
     port: int
     confidence_threshold: float
     pending_store_path: str
+    recent_store_path: str
     timezone: str
     todoist_enabled: bool
     todoist_api_token: str
@@ -64,6 +65,7 @@ def get_settings() -> Settings:
         port=int(os.getenv("PORT", "8080")),
         confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.70")),
         pending_store_path=os.getenv("PENDING_STORE_PATH", "data/pending.json"),
+        recent_store_path=os.getenv("RECENT_STORE_PATH", "data/recent.json"),
         timezone=os.getenv("TIMEZONE", "America/Mexico_City"),
         todoist_enabled=_bool("TODOIST_ENABLED", False),
         todoist_api_token=os.getenv("TODOIST_API_TOKEN", ""),

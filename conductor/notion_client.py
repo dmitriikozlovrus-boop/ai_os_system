@@ -49,49 +49,34 @@ class NotionClient:
         return [p for p in projects if p["name"]]
 
     def create_task(self, item: TaskItem, *, source: str = "Telegram") -> str:
-        properties: dict[str, Any] = {
-            "Task": _title_prop(item.title),
-            "Status": _status_prop("Inbox"),
-            "Kind": _select_prop("Task"),
-            "Priority": _select_prop(_priority(item.priority)),
-            "Sync status": _select_prop("Not synced"),
-            "Sync → Todoist": {"checkbox": False},
-            "Project": _rich_text_prop(item.project or ""),
-            "Area": _select_prop(_area_for_tasks(item.area)),
-            "Next Step": _rich_text_prop(item.next_step),
-        }
-        effort = normalize_effort(item.effort_minutes)
-        if effort:
-            properties["Effort"] = _select_prop(effort)
-        if item.due_date:
-            properties["Due"] = _date_prop(item.due_date)
-
         payload = {
             "parent": {"database_id": self.tasks_db},
-            "properties": properties,
+            "properties": _task_properties(item),
             "children": _task_children(item, source),
         }
         data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
         return data.get("url", "")
 
     def create_study(self, item: StudyItem) -> str:
-        properties: dict[str, Any] = {
-            "Вопрос / проблема": _title_prop(item.question),
-            "Расширенное описание": _rich_text_prop(item.description),
-            "Отрасль": _rich_text_prop(item.industry),
-            "Тип исследования": _select_prop(_research_type(item.research_type)),
-            "Проект": _rich_text_prop(item.project or ""),
-            "Направление": _select_prop(_area(item.area)),
-            "Приоритет": _select_prop(_priority(item.priority)),
-            "Формат результата": _select_prop(_result_format(item.result_format)),
-            "Источник задачи": _rich_text_prop(item.source or "Telegram"),
-            "Статус": _select_prop("Inbox"),
-        }
-        if item.due_date:
-            properties["Срок"] = _date_prop(item.due_date)
-        payload = {"parent": {"database_id": self.study_db}, "properties": properties}
+        payload = {"parent": {"database_id": self.study_db}, "properties": _study_properties(item)}
         data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
         return data.get("url", "")
+
+    def update_task(self, page_id: str, item: TaskItem) -> None:
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=self.headers,
+            payload={"properties": _task_properties(item)},
+        )
+
+    def update_study(self, page_id: str, item: StudyItem) -> None:
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=self.headers,
+            payload={"properties": _study_properties(item)},
+        )
 
 
 def _task_children(item: TaskItem, source: str) -> list[dict[str, Any]]:
@@ -112,6 +97,44 @@ def _task_children(item: TaskItem, source: str) -> list[dict[str, Any]]:
             }
         )
     return children
+
+
+def _task_properties(item: TaskItem) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "Task": _title_prop(item.title),
+        "Status": _status_prop("Inbox"),
+        "Kind": _select_prop("Task"),
+        "Priority": _select_prop(_priority(item.priority)),
+        "Sync status": _select_prop("Not synced"),
+        "Sync → Todoist": {"checkbox": False},
+        "Project": _rich_text_prop(item.project or ""),
+        "Area": _select_prop(_area_for_tasks(item.area)),
+        "Next Step": _rich_text_prop(item.next_step),
+    }
+    effort = normalize_effort(item.effort_minutes)
+    if effort:
+        properties["Effort"] = _select_prop(effort)
+    else:
+        properties["Effort"] = _select_prop(None)
+    properties["Due"] = _date_prop(item.due_date) if item.due_date else {"date": None}
+    return properties
+
+
+def _study_properties(item: StudyItem) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "Вопрос / проблема": _title_prop(item.question),
+        "Расширенное описание": _rich_text_prop(item.description),
+        "Отрасль": _rich_text_prop(item.industry),
+        "Тип исследования": _select_prop(_research_type(item.research_type)),
+        "Проект": _rich_text_prop(item.project or ""),
+        "Направление": _select_prop(_area(item.area)),
+        "Приоритет": _select_prop(_priority(item.priority)),
+        "Формат результата": _select_prop(_result_format(item.result_format)),
+        "Источник задачи": _rich_text_prop(item.source or "Telegram"),
+        "Статус": _select_prop("Inbox"),
+        "Срок": _date_prop(item.due_date) if item.due_date else {"date": None},
+    }
+    return properties
 
 
 def _title(prop: dict[str, Any] | None) -> str:
