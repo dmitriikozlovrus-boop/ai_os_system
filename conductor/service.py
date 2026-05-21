@@ -37,6 +37,9 @@ class ConductorService:
             pending = self.pending.pop_oldest_for_chat(chat_id)
             if pending:
                 _, pending_item = pending
+        if chat_id is not None and not pending_item and _looks_like_edit_request(text):
+            self.telegram.send_message(chat_id, _edit_guidance_message())
+            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
         try:
             projects = self.notion.list_projects()
         except Exception as exc:  # noqa: BLE001 - missing project context should not break capture.
@@ -170,6 +173,19 @@ class ConductorService:
 def _format_questions(title: str, questions: list[str]) -> str:
     joined = "\n".join(f"- {q}" for q in questions)
     return f"Нужно уточнение по записи:\n{title}\n\n{joined}\n\nОтветь одним сообщением, я сохраню это как уточнение для следующего шага."
+
+
+def _edit_guidance_message() -> str:
+    return (
+        "Пока я не умею править уже сохраненную запись по слову 'поправь' автоматически.\n\n"
+        "Пришли одной фразой готовую правку целиком, например:\n"
+        "Исправь задачу: Написать Марко\n"
+        "Направление: Бизнес\n"
+        "Проект: СЫРЬЕВОЙ ТРЕЙДИНГ\n"
+        "Дата исполнения: 2026-05-22\n"
+        "Длительность работы: 15 минут\n\n"
+        "Или просто отправь задачу заново в правильном виде, а я зафиксирую ее как новую."
+    )
 
 
 def _format_created_summary(classification: Classification, *, from_clarification: bool = False) -> str:
@@ -310,3 +326,8 @@ def _extract_area_from_answer(answer: str) -> str | None:
         return "Личное развитие"
     normalized = _normalize_area(answer.strip())
     return normalized if normalized in {"Работа", "Бизнес", "Личное развитие", "Семья", "Прочее"} else None
+
+
+def _looks_like_edit_request(text: str) -> bool:
+    lower = text.strip().casefold()
+    return lower.startswith(("поправь", "исправь", "измени", "не так", "неправильно"))

@@ -174,6 +174,18 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result.tasks[0].missing, [])
         self.assertGreaterEqual(result.tasks[0].confidence, 0.85)
 
+    def test_edit_request_without_pending_returns_guidance(self):
+        service = object.__new__(ConductorService)
+        service.pending = Mock()
+        service.pending.pop_oldest_for_chat.return_value = None
+        service.telegram = Mock()
+
+        result = service.process_text("Поправь", chat_id=42)
+
+        self.assertEqual(result["notes"], ["edit guidance sent"])
+        service.telegram.send_message.assert_called_once()
+        self.assertIn("Пока я не умею править уже сохраненную запись", service.telegram.send_message.call_args.args[1])
+
     def test_created_summary_uses_explicit_multiline_format(self):
         classification = classification_from_dict(
             {
