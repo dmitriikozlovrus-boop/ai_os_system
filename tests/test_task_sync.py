@@ -115,7 +115,7 @@ class TodoistMappingTest(unittest.TestCase):
 
 
 class TaskSyncTest(unittest.TestCase):
-    def test_fresh_deployment_rebuilds_todoist_from_notion(self):
+    def test_fresh_deployment_does_not_rebuild_todoist_from_notion(self):
         todoist = Mock(spec=TodoistClient)
         todoist.enabled = True
         todoist.api_token = "token"
@@ -150,7 +150,7 @@ class TaskSyncTest(unittest.TestCase):
             service._mark_notion_sync = Mock()
             service._sync_notion_task(notion, {"todo-1": todo}, {}, result)
             todoist.update_task.assert_not_called()
-            todoist.update_task_location.assert_called_once_with("todo-1", "inbox-1", "section-other")
+            todoist.update_task_location.assert_not_called()
 
     def test_todoist_rate_limit_retry_after_is_honored(self):
         self.assertEqual(
@@ -382,6 +382,54 @@ class TaskSyncTest(unittest.TestCase):
                 properties = request.call_args.kwargs["payload"]["properties"]
                 self.assertEqual(properties["Проект"], {"relation": [{"id": "project-1"}]})
                 self.assertEqual(properties["Stream"], {"relation": [{"id": "stream-work"}]})
+
+    def test_fresh_deployment_imports_todoist_section_into_notion_stream(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            tasks = [{"page_id": "page-1", "todoist_id": "todo-1", "project_id": None, "stream_id": None}]
+            with unittest.mock.patch("conductor.task_sync.request_json") as request:
+                imported = service._bootstrap_notion_routing(
+                    tasks,
+                    {"todo-1": {"id": "todo-1", "labels": [], "section_id": "section-business", "is_completed": False}},
+                    {},
+                    {"бизнес": {"id": "stream-business", "name": "БИЗНЕС"}},
+                    {"бизнес": "section-business", "прочее": "section-other"},
+                )
+            self.assertEqual(imported, 1)
+            self.assertEqual(tasks[0]["stream_id"], "stream-business")
+            properties = request.call_args.kwargs["payload"]["properties"]
+            self.assertEqual(properties["Stream"], {"relation": [{"id": "stream-business"}]})
+            todoist.update_task_routing_batch.assert_not_called()
+
+    def test_fresh_deployment_imports_other_section_as_empty_notion_stream(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            tasks = [
+                {
+                    "page_id": "page-1",
+                    "todoist_id": "todo-1",
+                    "project_id": None,
+                    "stream_id": "stream-business",
+                }
+            ]
+            with unittest.mock.patch("conductor.task_sync.request_json") as request:
+                imported = service._bootstrap_notion_routing(
+                    tasks,
+                    {"todo-1": {"id": "todo-1", "labels": [], "section_id": "section-other", "is_completed": False}},
+                    {},
+                    {"бизнес": {"id": "stream-business", "name": "БИЗНЕС"}},
+                    {"бизнес": "section-business", "прочее": "section-other"},
+                )
+            self.assertEqual(imported, 1)
+            self.assertIsNone(tasks[0]["stream_id"])
+            properties = request.call_args.kwargs["payload"]["properties"]
+            self.assertEqual(properties["Stream"], {"relation": []})
 
     def test_changed_todoist_label_updates_notion_project(self):
         todoist = Mock(spec=TodoistClient)

@@ -100,9 +100,15 @@ class TaskSyncService:
             linked_ids = {task["todoist_id"] for task in notion_tasks if task["todoist_id"]}
             self._link_existing_matches(notion_tasks, todoist_tasks, linked_ids)
             self._enrich_missing_notion_routing(notion_tasks, todoist_tasks, projects, streams)
-            self._attach_notion_routing(notion_tasks, projects, streams, inbox_project_id, sections)
             if not any(key != "__meta__" for key in state):
-                self._rebuild_todoist_routing(notion_tasks, todoist_tasks)
+                result.todoist_to_notion += self._bootstrap_notion_routing(
+                    notion_tasks,
+                    todoist_tasks,
+                    projects,
+                    streams,
+                    sections,
+                )
+            self._attach_notion_routing(notion_tasks, projects, streams, inbox_project_id, sections)
 
             for notion_task in notion_tasks:
                 try:
@@ -269,9 +275,8 @@ class TaskSyncService:
         notion_changed = notion_fingerprint != prior.get("notion")
         todoist_changed = todoist_fingerprint != prior.get("todoist")
         if not prior:
-            # Notion is the information core. After a fresh deployment, rebuild
-            # Todoist from Notion instead of treating missing sync history as a
-            # user edit made in Todoist.
+            # Bootstrap routing is imported from Todoist before this method.
+            # Treat the resulting pair as the new baseline.
             notion_changed = False
             todoist_changed = False
 
@@ -294,7 +299,7 @@ class TaskSyncService:
                 self._enforce_todoist_routing(notion_task, todoist_task)
                 self._mark_notion_sync(notion_task["page_id"], "Synced")
                 result.notion_to_todoist += 1
-        else:
+        elif prior:
             self._enforce_todoist_routing(notion_task, todoist_task)
         state[notion_task["page_id"]] = {
             "notion": notion_fingerprint,
@@ -322,33 +327,37 @@ class TaskSyncService:
             todoist_task["project_id"] = notion_task["inbox_project_id"]
             todoist_task["section_id"] = expected_section
 
-    def _rebuild_todoist_routing(
+    def _bootstrap_notion_routing(
         self,
         notion_tasks: list[dict[str, Any]],
         todoist_tasks: dict[str, dict[str, Any]],
-    ) -> None:
-        changes: list[dict[str, Any]] = []
+        projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+        sections: dict[str, str],
+    ) -> int:
+        imported = 0
         for notion_task in notion_tasks:
             todoist_task = todoist_tasks.get(notion_task.get("todoist_id", ""))
             if not todoist_task or todoist_task.get("is_completed"):
                 continue
-            labels = [notion_task["project_name"]] if notion_task.get("project_name") else []
-            changes.append(
-                {
-                    "id": notion_task["todoist_id"],
-                    "labels": labels,
-                    "content": notion_task.get("title"),
-                    "description": notion_task.get("description"),
-                    "priority": notion_task.get("priority"),
-                    "project_id": notion_task["inbox_project_id"],
-                    "section_id": notion_task.get("section_id"),
-                }
+            properties = _notion_routing_from_todoist(todoist_task, projects, streams, sections)
+            project_id = _plain_relation_id(properties["Проект"])
+            stream_id = _plain_relation_id(properties["Stream"])
+            if (
+                (notion_task.get("project_id") or "") == (project_id or "")
+                and (notion_task.get("stream_id") or "") == (stream_id or "")
+            ):
+                continue
+            request_json(
+                "PATCH",
+                f"https://api.notion.com/v1/pages/{notion_task['page_id']}",
+                headers=self.notion_headers,
+                payload={"properties": properties},
             )
-            todoist_task["labels"] = labels
-            todoist_task["project_id"] = notion_task["inbox_project_id"]
-            todoist_task["section_id"] = notion_task.get("section_id")
-        if changes:
-            self.todoist.update_task_routing_batch(changes)
+            notion_task["project_id"] = project_id
+            notion_task["stream_id"] = stream_id
+            imported += 1
+        return imported
 
     def _list_notion_tasks(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
