@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from .http import request_json
 from .models import TaskItem
@@ -70,6 +71,32 @@ class TodoistClient:
             payload={"name": name},
         )
         return response.get("id")
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        return self._list_resource("projects")
+
+    def list_sections(self) -> list[dict[str, Any]]:
+        return self._list_resource("sections")
+
+    def create_section(self, name: str, project_id: str) -> str | None:
+        response = request_json(
+            "POST",
+            f"{API_BASE}/sections",
+            headers=self.headers,
+            payload={"name": name, "project_id": project_id},
+        )
+        return response.get("id")
+
+    def update_task_location(self, task_id: str, project_id: str, section_id: str | None) -> None:
+        args: dict[str, Any] = {"id": task_id, "project_id": project_id}
+        if section_id:
+            args["section_id"] = section_id
+        request_json(
+            "POST",
+            f"{API_BASE}/sync",
+            headers=self.headers,
+            payload={"commands": [{"type": "item_move", "uuid": str(uuid4()), "args": args}]},
+        )
 
     def list_completed_tasks(self, since: str) -> list[dict[str, Any]]:
         if not self.enabled:
@@ -143,6 +170,27 @@ class TodoistClient:
     def delete_task(self, task_id: str) -> None:
         request_json("DELETE", f"{API_BASE}/tasks/{task_id}", headers=self.headers)
 
+    def _list_resource(self, resource: str) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            response = request_json(
+                "GET",
+                f"{API_BASE}/{resource}",
+                headers=self.headers,
+                query={"cursor": cursor, "limit": 200},
+            )
+            if isinstance(response, list):
+                items.extend(response)
+                break
+            items.extend(response.get("results", []))
+            cursor = response.get("next_cursor")
+            if not cursor:
+                break
+        return items
+
 
 def _task_payload(item: TaskItem | dict[str, Any]) -> dict[str, Any]:
     if isinstance(item, TaskItem):
@@ -171,6 +219,10 @@ def _task_payload(item: TaskItem | dict[str, Any]) -> dict[str, Any]:
         labels = [item["project_name"]] if item.get("project_name") else []
     if labels is not None:
         payload["labels"] = labels
+    if isinstance(item, dict) and item.get("inbox_project_id"):
+        payload["project_id"] = item["inbox_project_id"]
+        if item.get("section_id"):
+            payload["section_id"] = item["section_id"]
     return payload
 
 

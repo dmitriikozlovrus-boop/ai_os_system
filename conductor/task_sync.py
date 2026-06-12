@@ -21,6 +21,7 @@ class SyncResult:
     todoist_to_notion: int = 0
     completed: int = 0
     labels_created: int = 0
+    sections_created: int = 0
     errors: list[str] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -29,6 +30,7 @@ class SyncResult:
             "todoist_to_notion": self.todoist_to_notion,
             "completed": self.completed,
             "labels_created": self.labels_created,
+            "sections_created": self.sections_created,
             "errors": self.errors or [],
         }
 
@@ -42,6 +44,7 @@ class TaskSyncService:
         todoist: TodoistClient,
         state_path: str,
         completed_since: str = "2007-01-01",
+        streams_database_id: str = "",
     ):
         self.notion_token = notion_token
         self.tasks_database_id = tasks_database_id
@@ -49,6 +52,7 @@ class TaskSyncService:
         self.todoist = todoist
         self.state_path = Path(state_path)
         self.completed_since = completed_since
+        self.streams_database_id = streams_database_id
         self._lock = threading.Lock()
 
     @property
@@ -80,8 +84,10 @@ class TaskSyncService:
         try:
             state = self._load_state()
             notion_tasks = self._list_notion_tasks()
+            streams = self._list_notion_streams()
             projects = self._list_notion_projects()
             result.labels_created = self._ensure_todoist_project_labels(projects)
+            inbox_project_id, sections, result.sections_created = self._ensure_todoist_stream_sections(streams)
             active_tasks = self.todoist.list_tasks()
             completed_since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
             try:
@@ -90,9 +96,10 @@ class TaskSyncService:
                 completed_tasks = []
                 result.errors.append(f"Could not load completed Todoist tasks: {exc}")
             todoist_tasks = {str(task["id"]): task for task in [*active_tasks, *completed_tasks]}
-            self._attach_project_names(notion_tasks, projects)
             linked_ids = {task["todoist_id"] for task in notion_tasks if task["todoist_id"]}
             self._link_existing_matches(notion_tasks, todoist_tasks, linked_ids)
+            self._enrich_missing_notion_routing(notion_tasks, todoist_tasks, projects, streams)
+            self._attach_notion_routing(notion_tasks, projects, streams, inbox_project_id, sections)
 
             for notion_task in notion_tasks:
                 try:
@@ -197,6 +204,18 @@ class TaskSyncService:
             if todoist_task.get("labels", []) != expected_labels:
                 self.todoist.update_task_labels(todoist_id, expected_labels)
                 todoist_task["labels"] = expected_labels
+            expected_section = notion_task.get("section_id")
+            if notion_task.get("inbox_project_id") and (
+                str(todoist_task.get("project_id")) != notion_task["inbox_project_id"]
+                or str(todoist_task.get("section_id") or "") != str(expected_section or "")
+            ):
+                self.todoist.update_task_location(
+                    todoist_id,
+                    notion_task["inbox_project_id"],
+                    expected_section,
+                )
+                todoist_task["project_id"] = notion_task["inbox_project_id"]
+                todoist_task["section_id"] = expected_section
         if notion_task["status"] == "Done":
             if todoist_task and not todoist_task.get("is_completed"):
                 self.todoist.close_task(todoist_id)
@@ -318,11 +337,39 @@ class TaskSyncService:
             for row in data.get("results", []):
                 name = _plain_title(row.get("properties", {}).get("Project"))
                 if name:
-                    projects[_normalize_title(name)] = {"id": row.get("id", ""), "name": name}
+                    projects[_normalize_title(name)] = {
+                        "id": row.get("id", ""),
+                        "name": name,
+                        "stream_id": _plain_relation_id(row.get("properties", {}).get("Stream")) or "",
+                    }
             if not data.get("has_more"):
                 break
             cursor = data.get("next_cursor")
         return projects
+
+    def _list_notion_streams(self) -> dict[str, dict[str, str]]:
+        if not self.streams_database_id:
+            return {}
+        streams: dict[str, dict[str, str]] = {}
+        cursor: str | None = None
+        while True:
+            payload: dict[str, Any] = {"page_size": 100}
+            if cursor:
+                payload["start_cursor"] = cursor
+            data = request_json(
+                "POST",
+                f"https://api.notion.com/v1/databases/{self.streams_database_id}/query",
+                headers=self.notion_headers,
+                payload=payload,
+            )
+            for row in data.get("results", []):
+                name = _plain_title(row.get("properties", {}).get("Направление"))
+                if name:
+                    streams[_normalize_title(name)] = {"id": row.get("id", ""), "name": name}
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+        return streams
 
     def _ensure_todoist_project_labels(self, projects: dict[str, dict[str, str]]) -> int:
         existing = {_normalize_title(label.get("name")) for label in self.todoist.list_labels()}
@@ -335,14 +382,76 @@ class TaskSyncService:
             created += 1
         return created
 
+    def _ensure_todoist_stream_sections(
+        self,
+        streams: dict[str, dict[str, str]],
+    ) -> tuple[str, dict[str, str], int]:
+        inbox = next((project for project in self.todoist.list_projects() if project.get("inbox_project")), None)
+        if not inbox:
+            raise RuntimeError("Todoist Inbox project was not found")
+        inbox_id = str(inbox["id"])
+        sections = {
+            _normalize_title(section.get("name")): str(section["id"])
+            for section in self.todoist.list_sections()
+            if str(section.get("project_id")) == inbox_id
+        }
+        created = 0
+        for key, stream in streams.items():
+            if key in sections:
+                continue
+            section_id = self.todoist.create_section(stream["name"], inbox_id)
+            sections[key] = str(section_id)
+            created += 1
+        return inbox_id, sections, created
+
+    def _enrich_missing_notion_routing(
+        self,
+        notion_tasks: list[dict[str, Any]],
+        todoist_tasks: dict[str, dict[str, Any]],
+        projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+    ) -> None:
+        for task in notion_tasks:
+            todoist_task = todoist_tasks.get(task.get("todoist_id", ""))
+            if not todoist_task:
+                continue
+            labels = [_normalize_title(label) for label in todoist_task.get("labels") or []]
+            properties: dict[str, Any] = {}
+            if not task.get("project_id"):
+                project = next((projects[label] for label in labels if label in projects), None)
+                if project:
+                    task["project_id"] = project["id"]
+                    properties["Проект"] = _relation(project["id"])
+            if not task.get("stream_id"):
+                stream = next((streams[label] for label in labels if label in streams), None)
+                if stream:
+                    task["stream_id"] = stream["id"]
+                    properties["Stream"] = _relation(stream["id"])
+            if properties:
+                request_json(
+                    "PATCH",
+                    f"https://api.notion.com/v1/pages/{task['page_id']}",
+                    headers=self.notion_headers,
+                    payload={"properties": properties},
+                )
+
     @staticmethod
-    def _attach_project_names(
+    def _attach_notion_routing(
         notion_tasks: list[dict[str, Any]],
         projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+        inbox_project_id: str,
+        sections: dict[str, str],
     ) -> None:
-        names_by_id = {project["id"]: project["name"] for project in projects.values()}
+        projects_by_id = {project["id"]: project for project in projects.values()}
+        stream_names_by_id = {stream["id"]: stream["name"] for stream in streams.values()}
         for task in notion_tasks:
-            task["project_name"] = names_by_id.get(task.get("project_id"), "")
+            project = projects_by_id.get(task.get("project_id"), {})
+            task["project_name"] = project.get("name", "")
+            stream_id = task.get("stream_id") or project.get("stream_id")
+            task["stream_name"] = stream_names_by_id.get(stream_id, "")
+            task["inbox_project_id"] = inbox_project_id
+            task["section_id"] = sections.get(_normalize_title(task["stream_name"]))
 
     def _find_notion_by_todoist_id(self, todoist_id: str) -> dict[str, Any] | None:
         data = request_json(
@@ -430,6 +539,7 @@ class TaskSyncService:
             "deadline": _plain_date(props.get("Deadline")),
             "todoist_id": _plain_rich_text(props.get("Todoist ID")),
             "project_id": _plain_relation_id(props.get("Проект")),
+            "stream_id": _plain_relation_id(props.get("Stream")),
             "last_edited_time": row.get("last_edited_time", ""),
         }
 
@@ -492,6 +602,10 @@ def _date(value: str | None) -> dict[str, Any]:
     return {"date": {"start": value}} if value else {"date": None}
 
 
+def _relation(page_id: str) -> dict[str, Any]:
+    return {"relation": [{"id": page_id}]}
+
+
 def _plain_title(prop: dict[str, Any] | None) -> str:
     return "".join(item.get("plain_text", "") for item in (prop or {}).get("title", []))
 
@@ -548,6 +662,7 @@ def _fingerprint(value: dict[str, Any]) -> str:
             "deadline": value.get("deadline"),
             "todoist_id": value.get("todoist_id"),
             "project_name": value.get("project_name"),
+            "stream_name": value.get("stream_name"),
         }
     else:
         relevant = {

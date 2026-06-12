@@ -201,6 +201,75 @@ class TaskSyncTest(unittest.TestCase):
             todoist.create_label.assert_called_once_with("New Project")
             self.assertEqual(created, 1)
 
+    def test_notion_streams_become_inbox_sections(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        todoist.list_projects.return_value = [{"id": "inbox-1", "inbox_project": True}]
+        todoist.list_sections.return_value = [{"id": "section-1", "name": "РАБОТА", "project_id": "inbox-1"}]
+        todoist.create_section.return_value = "section-2"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            inbox_id, sections, created = service._ensure_todoist_stream_sections(
+                {
+                    "работа": {"id": "stream-1", "name": "РАБОТА"},
+                    "бизнес": {"id": "stream-2", "name": "БИЗНЕС"},
+                }
+            )
+            self.assertEqual(inbox_id, "inbox-1")
+            self.assertEqual(sections["работа"], "section-1")
+            self.assertEqual(sections["бизнес"], "section-2")
+            todoist.create_section.assert_called_once_with("БИЗНЕС", "inbox-1")
+            self.assertEqual(created, 1)
+
+    def test_task_stream_overrides_project_stream_for_inbox_section(self):
+        tasks = [{"project_id": "project-1", "stream_id": "stream-family"}]
+        TaskSyncService._attach_notion_routing(
+            tasks,
+            {"project": {"id": "project-1", "name": "Project", "stream_id": "stream-work"}},
+            {
+                "работа": {"id": "stream-work", "name": "РАБОТА"},
+                "семья": {"id": "stream-family", "name": "СЕМЬЯ"},
+            },
+            "inbox-1",
+            {"работа": "section-work", "семья": "section-family"},
+        )
+        self.assertEqual(tasks[0]["stream_name"], "СЕМЬЯ")
+        self.assertEqual(tasks[0]["section_id"], "section-family")
+
+    def test_project_stream_is_used_when_task_stream_is_empty(self):
+        tasks = [{"project_id": "project-1", "stream_id": None}]
+        TaskSyncService._attach_notion_routing(
+            tasks,
+            {"project": {"id": "project-1", "name": "Project", "stream_id": "stream-work"}},
+            {"работа": {"id": "stream-work", "name": "РАБОТА"}},
+            "inbox-1",
+            {"работа": "section-work"},
+        )
+        self.assertEqual(tasks[0]["stream_name"], "РАБОТА")
+        self.assertEqual(tasks[0]["section_id"], "section-work")
+
+    def test_empty_notion_routing_is_initialized_from_matching_todoist_labels(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            with unittest.mock.patch("conductor.task_sync.request_json") as request:
+                tasks = [{"page_id": "page-1", "todoist_id": "todo-1", "project_id": None, "stream_id": None}]
+                service._enrich_missing_notion_routing(
+                    tasks,
+                    {"todo-1": {"labels": ["Project A", "РАБОТА"]}},
+                    {"project a": {"id": "project-1", "name": "Project A", "stream_id": "stream-work"}},
+                    {"работа": {"id": "stream-work", "name": "РАБОТА"}},
+                )
+                self.assertEqual(tasks[0]["project_id"], "project-1")
+                self.assertEqual(tasks[0]["stream_id"], "stream-work")
+                request.assert_called_once()
+                properties = request.call_args.kwargs["payload"]["properties"]
+                self.assertEqual(properties["Проект"], {"relation": [{"id": "project-1"}]})
+                self.assertEqual(properties["Stream"], {"relation": [{"id": "stream-work"}]})
+
     def test_notion_project_overwrites_todoist_labels(self):
         todoist = Mock(spec=TodoistClient)
         todoist.enabled = True
@@ -238,6 +307,49 @@ class TaskSyncTest(unittest.TestCase):
             result = SyncResult(errors=[])
             service._sync_notion_task(notion, {"todo-1": todo}, state, result)
             todoist.update_task_labels.assert_called_once_with("todo-1", ["Notion Project"])
+
+    def test_notion_stream_moves_task_to_inbox_section(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            notion = {
+                "page_id": "page-1",
+                "title": "Task",
+                "description": "",
+                "status": "Backlog",
+                "priority": "P2",
+                "due_date": None,
+                "deadline": None,
+                "todoist_id": "todo-1",
+                "project_name": "Notion Project",
+                "stream_name": "РАБОТА",
+                "inbox_project_id": "inbox-1",
+                "section_id": "section-work",
+                "last_edited_time": "2026-06-12T10:00:00Z",
+            }
+            todo = {
+                "id": "todo-1",
+                "content": "Task",
+                "description": "",
+                "priority": 2,
+                "labels": ["Notion Project"],
+                "project_id": "another-project",
+                "section_id": None,
+                "is_completed": False,
+                "updated_at": "2026-06-12T10:00:00Z",
+            }
+            state = {
+                "page-1": {
+                    "notion": _fingerprint(notion),
+                    "todoist": _fingerprint(todo),
+                    "todoist_id": "todo-1",
+                }
+            }
+            result = SyncResult(errors=[])
+            service._sync_notion_task(notion, {"todo-1": todo}, state, result)
+            todoist.update_task_location.assert_called_once_with("todo-1", "inbox-1", "section-work")
 
     def test_completed_notion_task_is_created_and_closed_in_todoist(self):
         todoist = Mock(spec=TodoistClient)

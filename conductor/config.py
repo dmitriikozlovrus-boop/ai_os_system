@@ -38,6 +38,7 @@ class Settings:
     notion_tasks_database_id: str
     notion_study_database_id: str
     notion_projects_database_id: str
+    notion_streams_database_id: str
     host: str
     port: int
     confidence_threshold: float
@@ -67,6 +68,7 @@ def get_settings() -> Settings:
         notion_tasks_database_id=os.getenv("NOTION_TASKS_DATABASE_ID", ""),
         notion_study_database_id=os.getenv("NOTION_STUDY_DATABASE_ID", ""),
         notion_projects_database_id=os.getenv("NOTION_PROJECTS_DATABASE_ID", ""),
+        notion_streams_database_id=os.getenv("NOTION_STREAMS_DATABASE_ID", ""),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
         confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.70")),
