@@ -172,7 +172,6 @@ class TaskSyncService:
                 self._update_notion_status(notion_task["page_id"], "Backlog")
             return {"ok": True, "action": "reopened_in_notion"}
         if event_name in {"item:added", "item:updated"}:
-            data = self.todoist.get_task(task_id)
             projects = self._list_notion_projects()
             streams = self._list_notion_streams()
             _, sections, _ = self._ensure_todoist_stream_sections(streams)
