@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -10,6 +11,7 @@ from conductor.task_sync import (
     _match_key_notion,
     _match_key_todoist,
     _notion_properties_from_todoist,
+    _parse_time,
     _priority_to_strategic,
     _strategic_to_priority,
 )
@@ -38,6 +40,13 @@ class TodoistMappingTest(unittest.TestCase):
         self.assertEqual(payload["priority"], 1)
         self.assertEqual(payload["due_date"], "2026-06-13")
         self.assertEqual(payload["deadline_date"], "2026-06-15")
+
+    def test_todoist_payload_uses_fallback_for_empty_title(self):
+        self.assertEqual(_task_payload({"title": ""})["content"], "Без названия")
+
+    def test_parse_time_handles_iso_and_empty_values(self):
+        self.assertEqual(_parse_time("2026-06-12T10:00:00Z"), datetime(2026, 6, 12, 10, tzinfo=timezone.utc))
+        self.assertEqual(_parse_time(None), datetime.min.replace(tzinfo=timezone.utc))
 
     def test_notion_project_becomes_todoist_label(self):
         payload = _task_payload(

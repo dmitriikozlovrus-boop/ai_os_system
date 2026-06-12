@@ -650,6 +650,10 @@ def _priority_to_strategic(value: str) -> str:
 def _parse_time(value: str | None) -> datetime:
     if not value:
         return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _fingerprint(value: dict[str, Any]) -> str:
@@ -689,7 +693,3 @@ def _match_key_todoist(task: dict[str, Any]) -> tuple[str, str]:
 
 def _normalize_title(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return datetime.min.replace(tzinfo=timezone.utc)

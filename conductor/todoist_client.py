@@ -200,7 +200,7 @@ def _task_payload(item: TaskItem | dict[str, Any]) -> dict[str, Any]:
         due_date = item.due_date
         deadline = None
     else:
-        title = str(item.get("title") or "")
+        title = str(item.get("title") or "Без названия")
         description = str(item.get("description") or "")
         priority = str(item.get("priority") or "")
         due_date = item.get("due_date")
