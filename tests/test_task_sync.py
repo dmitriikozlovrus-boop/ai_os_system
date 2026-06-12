@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
+from conductor.http import HttpError
 from conductor.task_sync import (
     SyncResult,
     TaskSyncService,
@@ -14,6 +15,7 @@ from conductor.task_sync import (
     _notion_routing_from_todoist,
     _parse_time,
     _priority_to_strategic,
+    _retry_after,
     _strategic_to_priority,
 )
 from conductor.todoist_client import TodoistClient, _task_payload, todoist_priority
@@ -147,8 +149,14 @@ class TaskSyncTest(unittest.TestCase):
             result = SyncResult(errors=[])
             service._mark_notion_sync = Mock()
             service._sync_notion_task(notion, {"todo-1": todo}, {}, result)
-            todoist.update_task.assert_called_once_with("todo-1", notion)
+            todoist.update_task.assert_not_called()
             todoist.update_task_location.assert_called_once_with("todo-1", "inbox-1", "section-other")
+
+    def test_todoist_rate_limit_retry_after_is_honored(self):
+        self.assertEqual(
+            _retry_after(HttpError(429, '{"error_extra":{"retry_after":1280}}')),
+            1280,
+        )
 
     def test_linked_unchanged_task_does_not_sync_again(self):
         todoist = Mock(spec=TodoistClient)

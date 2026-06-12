@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .http import request_json
+from .http import HttpError, request_json
 from .todoist_client import TodoistClient, todoist_priority
 
 NOTION_VERSION = "2022-06-28"
@@ -273,7 +273,7 @@ class TaskSyncService:
             # Notion is the information core. After a fresh deployment, rebuild
             # Todoist from Notion instead of treating missing sync history as a
             # user edit made in Todoist.
-            notion_changed = not _todoist_content_matches_notion(todoist_task, notion_task)
+            notion_changed = False
             todoist_changed = False
 
         if todoist_changed and not notion_changed:
@@ -338,6 +338,9 @@ class TaskSyncService:
                 {
                     "id": notion_task["todoist_id"],
                     "labels": labels,
+                    "content": notion_task.get("title"),
+                    "description": notion_task.get("description"),
+                    "priority": notion_task.get("priority"),
                     "project_id": notion_task["inbox_project_id"],
                     "section_id": notion_task.get("section_id"),
                 }
@@ -622,6 +625,11 @@ class TaskSyncLoop:
         while True:
             try:
                 print(f"Todoist sync: {self.service.sync()}", flush=True)
+            except HttpError as exc:
+                retry_after = _retry_after(exc)
+                print(f"Todoist sync failed: {exc}", flush=True)
+                time.sleep(retry_after)
+                continue
             except Exception as exc:  # noqa: BLE001
                 print(f"Todoist sync failed: {exc}", flush=True)
             time.sleep(self.interval_seconds)
@@ -733,16 +741,14 @@ def _parse_time(value: str | None) -> datetime:
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def _todoist_content_matches_notion(todoist_task: dict[str, Any], notion_task: dict[str, Any]) -> bool:
-    due = todoist_task.get("due") or {}
-    deadline = todoist_task.get("deadline") or {}
-    return (
-        str(todoist_task.get("content") or "") == str(notion_task.get("title") or "")
-        and str(todoist_task.get("description") or "") == str(notion_task.get("description") or "")
-        and todoist_priority(todoist_task.get("priority")) == notion_task.get("priority")
-        and due.get("date") == notion_task.get("due_date")
-        and deadline.get("date") == notion_task.get("deadline")
-    )
+def _retry_after(exc: HttpError) -> int:
+    if exc.status != 429:
+        return 300
+    try:
+        body = json.loads(exc.body)
+        return max(int(body.get("error_extra", {}).get("retry_after") or 300), 300)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 300
 
 
 def _fingerprint(value: dict[str, Any]) -> str:

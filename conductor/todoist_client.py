@@ -113,7 +113,13 @@ class TodoistClient:
                 {
                     "type": "item_update",
                     "uuid": labels_uuid,
-                    "args": {"id": task_id, "labels": change.get("labels") or []},
+                    "args": {
+                        "id": task_id,
+                        "labels": change.get("labels") or [],
+                        "content": change.get("content") or "Без названия",
+                        "description": change.get("description") or "",
+                        "priority": _priority(str(change.get("priority") or "")),
+                    },
                 }
             )
             move_uuid = str(uuid4())
