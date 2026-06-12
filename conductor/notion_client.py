@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .http import request_json
-from .models import StudyItem, TaskItem, normalize_effort
+from .models import StudyItem, TaskItem
 
 
 NOTION_VERSION = "2022-06-28"
@@ -40,18 +40,19 @@ class NotionClient:
             projects.append(
                 {
                     "id": row.get("id", ""),
-                    "name": _title(props.get("Проект")),
-                    "area": _select(props.get("Направление")),
-                    "status": _select(props.get("Статус")),
+                    "name": _title(props.get("Project")),
+                    "area": "",
+                    "status": _select(props.get("Статус проекта")),
                     "url": row.get("url", ""),
                 }
             )
         return [p for p in projects if p["name"]]
 
     def create_task(self, item: TaskItem, *, source: str = "Telegram") -> str:
+        project_id = self._find_project_id(item.project)
         payload = {
             "parent": {"database_id": self.tasks_db},
-            "properties": _task_properties(item),
+            "properties": _task_properties(item, project_id=project_id),
             "children": _task_children(item, source),
         }
         data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
@@ -63,11 +64,12 @@ class NotionClient:
         return data.get("url", "")
 
     def update_task(self, page_id: str, item: TaskItem) -> None:
+        project_id = self._find_project_id(item.project)
         request_json(
             "PATCH",
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=self.headers,
-            payload={"properties": _task_properties(item)},
+            payload={"properties": _task_properties(item, project_id=project_id)},
         )
 
     def update_study(self, page_id: str, item: StudyItem) -> None:
@@ -77,6 +79,15 @@ class NotionClient:
             headers=self.headers,
             payload={"properties": _study_properties(item)},
         )
+
+    def _find_project_id(self, name: str | None) -> str | None:
+        if not name:
+            return None
+        normalized = " ".join(name.casefold().split())
+        for project in self.list_projects():
+            if " ".join(project["name"].casefold().split()) == normalized:
+                return project["id"]
+        return None
 
 
 def _task_children(item: TaskItem, source: str) -> list[dict[str, Any]]:
@@ -99,24 +110,19 @@ def _task_children(item: TaskItem, source: str) -> list[dict[str, Any]]:
     return children
 
 
-def _task_properties(item: TaskItem) -> dict[str, Any]:
+def _task_properties(item: TaskItem, *, project_id: str | None = None) -> dict[str, Any]:
     properties: dict[str, Any] = {
         "Task": _title_prop(item.title),
-        "Status": _status_prop("Inbox"),
-        "Kind": _select_prop("Task"),
-        "Priority": _select_prop(_priority(item.priority)),
+        "Статус": _status_prop("Backlog"),
+        "Source": _select_prop("Telegram Assistant"),
         "Sync status": _select_prop("Not synced"),
-        "Sync → Todoist": {"checkbox": False},
-        "Project": _rich_text_prop(item.project or ""),
-        "Area": _select_prop(_area_for_tasks(item.area)),
-        "Next Step": _rich_text_prop(item.next_step),
+        "Strategic Impact": _select_prop(_strategic_impact(item.priority)),
+        "Time zone": _select_prop("America/Mexico_City"),
     }
-    effort = normalize_effort(item.effort_minutes)
-    if effort:
-        properties["Effort"] = _select_prop(effort)
-    else:
-        properties["Effort"] = _select_prop(None)
-    properties["Due"] = _date_prop(item.due_date) if item.due_date else {"date": None}
+    properties["Оценка времени"] = _select_prop(_effort(item.effort_minutes))
+    properties["Deadline"] = _date_prop(item.due_date) if item.due_date else {"date": None}
+    if project_id:
+        properties["Проект"] = {"relation": [{"id": project_id}]}
     return properties
 
 
@@ -172,6 +178,23 @@ def _date_prop(value: str) -> dict[str, Any]:
 
 def _priority(value: str | None) -> str:
     return value if value in {"P1", "P2", "P3"} else "P2"
+
+
+def _strategic_impact(value: str | None) -> str:
+    return {"P1": "10", "P2": "8", "P3": "5"}.get(value or "", "2")
+
+
+def _effort(minutes: int | None) -> str | None:
+    if minutes is None:
+        return None
+    choices = [5, 10, 15, 20, 25, 30, 45, 60, 75, 90, 105, 120]
+    selected = min(choices, key=lambda value: abs(value - minutes))
+    if selected < 60:
+        return f"{selected} минут"
+    if selected == 60:
+        return "1 час"
+    hours, remainder = divmod(selected, 60)
+    return f"{hours} час{'а' if hours in {2, 3, 4} else 'ов'} {remainder} минут" if remainder else f"{hours} часа"
 
 
 def _area(value: str | None) -> str:

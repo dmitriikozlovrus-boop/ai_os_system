@@ -21,8 +21,12 @@ def request_json(
     *,
     headers: dict[str, str] | None = None,
     payload: dict[str, Any] | None = None,
+    query: dict[str, Any] | None = None,
     timeout: int = 60,
-) -> dict[str, Any]:
+) -> Any:
+    if query:
+        encoded = parse.urlencode({key: value for key, value in query.items() if value is not None})
+        url = f"{url}{'&' if '?' in url else '?'}{encoded}"
     body = None
     req_headers = dict(headers or {})
     if payload is not None:

@@ -5,6 +5,10 @@ services:
     plan: starter
     autoDeploy: true
     healthCheckPath: /healthz
+    disk:
+      name: conductor-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: HOST
         value: 0.0.0.0
@@ -21,7 +25,15 @@ services:
       - key: OPENAI_TRANSCRIBE_MODEL
         value: gpt-4o-mini-transcribe
       - key: TODOIST_ENABLED
-        value: false
+        value: true
+      - key: TODOIST_SYNC_INTERVAL_SECONDS
+        value: 300
+      - key: TODOIST_SYNC_ON_START
+        value: true
+      - key: TODOIST_SYNC_STATE_PATH
+        value: /var/data/todoist_sync_state.json
+      - key: TODOIST_COMPLETED_SINCE
+        value: 2007-01-01
       - key: NOTION_TASKS_DATABASE_ID
         value: be9d26fe652b474696cd5de0118b1210
       - key: NOTION_STUDY_DATABASE_ID
@@ -37,4 +49,8 @@ services:
       - key: NOTION_TOKEN
         sync: false
       - key: TODOIST_API_TOKEN
+        sync: false
+      - key: TODOIST_WEBHOOK_SECRET
+        sync: false
+      - key: TASK_SYNC_SECRET
         sync: false

@@ -46,6 +46,12 @@ class Settings:
     timezone: str
     todoist_enabled: bool
     todoist_api_token: str
+    todoist_webhook_secret: str
+    todoist_sync_interval_seconds: int
+    todoist_sync_on_start: bool
+    todoist_sync_state_path: str
+    task_sync_secret: str
+    todoist_completed_since: str
 
 
 def get_settings() -> Settings:
@@ -69,4 +75,10 @@ def get_settings() -> Settings:
         timezone=os.getenv("TIMEZONE", "America/Mexico_City"),
         todoist_enabled=_bool("TODOIST_ENABLED", False),
         todoist_api_token=os.getenv("TODOIST_API_TOKEN", ""),
+        todoist_webhook_secret=os.getenv("TODOIST_WEBHOOK_SECRET", ""),
+        todoist_sync_interval_seconds=int(os.getenv("TODOIST_SYNC_INTERVAL_SECONDS", "300")),
+        todoist_sync_on_start=_bool("TODOIST_SYNC_ON_START", True),
+        todoist_sync_state_path=os.getenv("TODOIST_SYNC_STATE_PATH", "data/todoist_sync_state.json"),
+        task_sync_secret=os.getenv("TASK_SYNC_SECRET", ""),
+        todoist_completed_since=os.getenv("TODOIST_COMPLETED_SINCE", "2007-01-01"),
     )

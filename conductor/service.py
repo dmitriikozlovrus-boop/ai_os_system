@@ -11,6 +11,7 @@ from .pending import PendingStore
 from .recent import RecentStore
 from .telegram import TelegramClient
 from .todoist_client import TodoistClient
+from .task_sync import TaskSyncService
 
 
 class ConductorService:
@@ -30,6 +31,14 @@ class ConductorService:
         )
         self.telegram = TelegramClient(settings.telegram_bot_token)
         self.todoist = TodoistClient(settings.todoist_api_token, settings.todoist_enabled)
+        self.task_sync = TaskSyncService(
+            settings.notion_token,
+            settings.notion_tasks_database_id,
+            settings.notion_projects_database_id,
+            self.todoist,
+            settings.todoist_sync_state_path,
+            settings.todoist_completed_since,
+        )
         self.pending = PendingStore(settings.pending_store_path)
         self.recent = RecentStore(settings.recent_store_path)
 
@@ -150,7 +159,6 @@ class ConductorService:
                 created_tasks.append(url)
                 if chat_id is not None:
                     self.recent.save(chat_id, _recent_payload("task", url, item.__dict__))
-                self.todoist.create_task(item)
             except Exception as exc:  # noqa: BLE001 - notify user rather than hide automation failures.
                 errors.append(f"Не удалось создать задачу '{item.title}': {exc}")
 
