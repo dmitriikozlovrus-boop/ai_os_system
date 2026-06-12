@@ -48,6 +48,15 @@ class TodoistMappingTest(unittest.TestCase):
         self.assertEqual(_parse_time("2026-06-12T10:00:00Z"), datetime(2026, 6, 12, 10, tzinfo=timezone.utc))
         self.assertEqual(_parse_time(None), datetime.min.replace(tzinfo=timezone.utc))
 
+    def test_move_to_section_does_not_also_send_project(self):
+        client = TodoistClient("token", True)
+        with unittest.mock.patch("conductor.todoist_client.request_json") as request:
+            request.return_value = {"sync_status": {"command-1": "ok"}}
+            with unittest.mock.patch("conductor.todoist_client.uuid4", return_value="command-1"):
+                client.update_task_location("task-1", "inbox-1", "section-1")
+        args = request.call_args.kwargs["payload"]["commands"][0]["args"]
+        self.assertEqual(args, {"id": "task-1", "section_id": "section-1"})
+
     def test_notion_project_becomes_todoist_label(self):
         payload = _task_payload(
             {

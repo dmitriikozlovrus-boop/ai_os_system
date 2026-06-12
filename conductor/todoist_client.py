@@ -88,15 +88,21 @@ class TodoistClient:
         return response.get("id")
 
     def update_task_location(self, task_id: str, project_id: str, section_id: str | None) -> None:
-        args: dict[str, Any] = {"id": task_id, "project_id": project_id}
+        args: dict[str, Any] = {"id": task_id}
         if section_id:
             args["section_id"] = section_id
-        request_json(
+        else:
+            args["project_id"] = project_id
+        command_uuid = str(uuid4())
+        response = request_json(
             "POST",
             f"{API_BASE}/sync",
             headers=self.headers,
-            payload={"commands": [{"type": "item_move", "uuid": str(uuid4()), "args": args}]},
+            payload={"commands": [{"type": "item_move", "uuid": command_uuid, "args": args}]},
         )
+        status = (response.get("sync_status") or {}).get(command_uuid)
+        if status != "ok":
+            raise RuntimeError(f"Todoist could not move task {task_id}: {status}")
 
     def list_completed_tasks(self, since: str) -> list[dict[str, Any]]:
         if not self.enabled:
