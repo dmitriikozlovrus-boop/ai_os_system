@@ -14,6 +14,7 @@ from conductor.task_sync import (
     _notion_properties_from_todoist,
     _notion_routing_from_todoist,
     _parse_time,
+    _project_stream_section,
     _priority_to_strategic,
     _retry_after,
     _strategic_to_priority,
@@ -107,6 +108,49 @@ class TodoistMappingTest(unittest.TestCase):
         )
         self.assertEqual(properties["Проект"], {"relation": []})
         self.assertEqual(properties["Stream"], {"relation": []})
+
+    def test_project_label_supplies_stream_when_task_is_in_other(self):
+        properties = _notion_routing_from_todoist(
+            {"labels": ["Project A"], "section_id": "section-other"},
+            {"project a": {"id": "project-1", "name": "Project A", "stream_id": "stream-business"}},
+            {"бизнес": {"id": "stream-business", "name": "БИЗНЕС"}},
+            {"бизнес": "section-business", "прочее": "section-other"},
+        )
+        self.assertEqual(properties["Проект"], {"relation": [{"id": "project-1"}]})
+        self.assertEqual(properties["Stream"], {"relation": [{"id": "stream-business"}]})
+
+    def test_manual_stream_section_overrides_project_stream(self):
+        properties = _notion_routing_from_todoist(
+            {"labels": ["Project A"], "section_id": "section-personal"},
+            {"project a": {"id": "project-1", "name": "Project A", "stream_id": "stream-business"}},
+            {
+                "бизнес": {"id": "stream-business", "name": "БИЗНЕС"},
+                "личное": {"id": "stream-personal", "name": "ЛИЧНОЕ"},
+            },
+            {"бизнес": "section-business", "личное": "section-personal", "прочее": "section-other"},
+        )
+        self.assertEqual(properties["Stream"], {"relation": [{"id": "stream-personal"}]})
+
+    def test_project_label_routes_other_task_to_project_stream_section(self):
+        section = _project_stream_section(
+            {"labels": ["Project A"], "section_id": "section-other"},
+            {"project a": {"id": "project-1", "name": "Project A", "stream_id": "stream-business"}},
+            {"бизнес": {"id": "stream-business", "name": "БИЗНЕС"}},
+            {"бизнес": "section-business", "прочее": "section-other"},
+        )
+        self.assertEqual(section, "section-business")
+
+    def test_project_label_does_not_override_manual_stream_section(self):
+        section = _project_stream_section(
+            {"labels": ["Project A"], "section_id": "section-personal"},
+            {"project a": {"id": "project-1", "name": "Project A", "stream_id": "stream-business"}},
+            {
+                "бизнес": {"id": "stream-business", "name": "БИЗНЕС"},
+                "личное": {"id": "stream-personal", "name": "ЛИЧНОЕ"},
+            },
+            {"бизнес": "section-business", "личное": "section-personal", "прочее": "section-other"},
+        )
+        self.assertIsNone(section)
 
     def test_existing_tasks_match_by_normalized_title_and_due_date(self):
         notion = {"title": "  Подготовить   письмо ", "due_date": "2026-06-13"}
@@ -234,6 +278,32 @@ class TaskSyncTest(unittest.TestCase):
             )
             todoist.get_task.assert_not_called()
             self.assertEqual(result["action"], "upserted_in_notion")
+
+    def test_webhook_project_label_moves_other_task_to_project_stream(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            service._find_notion_by_todoist_id = Mock(return_value={"page_id": "page-1"})
+            service._list_notion_projects = Mock(
+                return_value={"project a": {"id": "project-1", "name": "Project A", "stream_id": "stream-business"}}
+            )
+            service._list_notion_streams = Mock(
+                return_value={"бизнес": {"id": "stream-business", "name": "БИЗНЕС"}}
+            )
+            service._ensure_todoist_stream_sections = Mock(
+                return_value=("inbox-1", {"бизнес": "section-business", "прочее": "section-other"}, 0)
+            )
+            service._update_notion_from_todoist = Mock()
+            event_task = {
+                "id": "todo-1",
+                "content": "Task",
+                "labels": ["Project A"],
+                "section_id": "section-other",
+            }
+            service.handle_todoist_event({"event_name": "item:updated", "event_data": event_task})
+            todoist.update_task_location.assert_called_once_with("todo-1", "inbox-1", "section-business")
 
     def test_periodic_sync_completion_updates_notion(self):
         todoist = Mock(spec=TodoistClient)

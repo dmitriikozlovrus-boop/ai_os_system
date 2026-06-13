@@ -180,11 +180,14 @@ class TaskSyncService:
         if event_name in {"item:added", "item:updated"}:
             projects = self._list_notion_projects()
             streams = self._list_notion_streams()
-            _, sections, _ = self._ensure_todoist_stream_sections(streams)
+            inbox_project_id, sections, _ = self._ensure_todoist_stream_sections(streams)
             if notion_task:
                 self._update_notion_from_todoist(notion_task["page_id"], data, projects, streams, sections)
             else:
                 self._create_notion_from_todoist(data, projects, streams, sections)
+            target_section = _project_stream_section(data, projects, streams, sections)
+            if target_section:
+                self.todoist.update_task_location(task_id, inbox_project_id, target_section)
             return {"ok": True, "action": "upserted_in_notion"}
         return {"ignored": True, "reason": f"unsupported event {event_name}"}
 
@@ -669,10 +672,30 @@ def _notion_routing_from_todoist(
     section_id = str(task.get("section_id") or "")
     section_name = next((name for name, item_id in sections.items() if str(item_id) == section_id), "")
     stream = streams.get(section_name)
+    if not stream and project and project.get("stream_id"):
+        stream = next((item for item in streams.values() if item["id"] == project["stream_id"]), None)
     return {
         "Проект": _relation(project["id"]) if project else {"relation": []},
         "Stream": _relation(stream["id"]) if stream else {"relation": []},
     }
+
+
+def _project_stream_section(
+    task: dict[str, Any],
+    projects: dict[str, dict[str, str]],
+    streams: dict[str, dict[str, str]],
+    sections: dict[str, str],
+) -> str | None:
+    current_section_id = str(task.get("section_id") or "")
+    current_section_name = next((name for name, item_id in sections.items() if str(item_id) == current_section_id), "")
+    if current_section_name in streams:
+        return None
+    labels = [_normalize_title(label) for label in task.get("labels") or []]
+    project = next((projects[label] for label in labels if label in projects), None)
+    if not project or not project.get("stream_id"):
+        return None
+    stream = next((item for item in streams.values() if item["id"] == project["stream_id"]), None)
+    return sections.get(_normalize_title(stream["name"])) if stream else None
 
 
 def _title(value: str) -> dict[str, Any]:
