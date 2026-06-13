@@ -18,6 +18,7 @@ from conductor.task_sync import (
     _priority_to_strategic,
     _retry_after,
     _strategic_to_priority,
+    _todoist_routing_differs,
 )
 from conductor.todoist_client import TodoistClient, _task_payload, todoist_priority
 
@@ -151,6 +152,20 @@ class TodoistMappingTest(unittest.TestCase):
             {"бизнес": "section-business", "личное": "section-personal", "прочее": "section-other"},
         )
         self.assertIsNone(section)
+
+    def test_todoist_routing_difference_is_detected_against_notion(self):
+        self.assertTrue(
+            _todoist_routing_differs(
+                {"project_id": None, "stream_id": "stream-business"},
+                {"labels": [], "section_id": "section-personal"},
+                {},
+                {
+                    "бизнес": {"id": "stream-business", "name": "БИЗНЕС"},
+                    "личное": {"id": "stream-personal", "name": "ЛИЧНОЕ"},
+                },
+                {"бизнес": "section-business", "личное": "section-personal"},
+            )
+        )
 
     def test_existing_tasks_match_by_normalized_title_and_due_date(self):
         notion = {"title": "  Подготовить   письмо ", "due_date": "2026-06-13"}
@@ -549,6 +564,8 @@ class TaskSyncTest(unittest.TestCase):
                 "due_date": None,
                 "deadline": None,
                 "todoist_id": "todo-1",
+                "project_id": "project-1",
+                "stream_id": "stream-work",
                 "project_name": "Notion Project",
                 "last_edited_time": "2026-06-11T10:00:00Z",
             }
@@ -569,12 +586,12 @@ class TaskSyncTest(unittest.TestCase):
                 }
             }
             result = SyncResult(errors=[])
-            service._update_notion_from_todoist = Mock()
+            service._update_notion_routing_from_todoist = Mock()
             service._sync_notion_task(notion, {"todo-1": todo}, state, result)
-            service._update_notion_from_todoist.assert_called_once()
+            service._update_notion_routing_from_todoist.assert_called_once()
             todoist.update_task_labels.assert_not_called()
 
-    def test_notion_stream_moves_task_to_inbox_section(self):
+    def test_todoist_section_overrides_different_notion_stream(self):
         todoist = Mock(spec=TodoistClient)
         todoist.enabled = True
         todoist.api_token = "token"
@@ -601,8 +618,8 @@ class TaskSyncTest(unittest.TestCase):
                 "description": "",
                 "priority": 2,
                 "labels": ["Notion Project"],
-                "project_id": "another-project",
-                "section_id": None,
+                "project_id": "inbox-1",
+                "section_id": "section-personal",
                 "is_completed": False,
                 "updated_at": "2026-06-12T10:00:00Z",
             }
@@ -614,8 +631,22 @@ class TaskSyncTest(unittest.TestCase):
                 }
             }
             result = SyncResult(errors=[])
-            service._sync_notion_task(notion, {"todo-1": todo}, state, result)
-            todoist.update_task_location.assert_called_once_with("todo-1", "inbox-1", "section-work")
+            service._update_notion_routing_from_todoist = Mock()
+            service._sync_notion_task(
+                notion,
+                {"todo-1": todo},
+                state,
+                result,
+                {"notion project": {"id": "project-1", "name": "Notion Project", "stream_id": "stream-work"}},
+                {
+                    "работа": {"id": "stream-work", "name": "РАБОТА"},
+                    "личное": {"id": "stream-personal", "name": "ЛИЧНОЕ"},
+                },
+                {"работа": "section-work", "личное": "section-personal", "прочее": "section-other"},
+            )
+            service._update_notion_routing_from_todoist.assert_called_once()
+            todoist.update_task_location.assert_not_called()
+            self.assertEqual(result.todoist_to_notion, 1)
 
     def test_completed_notion_task_is_created_and_closed_in_todoist(self):
         todoist = Mock(spec=TodoistClient)

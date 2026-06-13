@@ -280,6 +280,32 @@ class TaskSyncService:
             result.notion_to_todoist += 1
             return
 
+        if _todoist_routing_differs(notion_task, todoist_task, projects, streams, sections):
+            self._update_notion_routing_from_todoist(notion_task["page_id"], todoist_task, projects, streams, sections)
+            project_id, stream_id = _routing_ids_from_todoist(todoist_task, projects, streams, sections)
+            notion_task["project_id"] = project_id
+            notion_task["stream_id"] = stream_id
+            notion_task["project_name"] = next(
+                (project["name"] for project in projects.values() if project["id"] == project_id),
+                "",
+            )
+            notion_task["stream_name"] = next(
+                (stream["name"] for stream in streams.values() if stream["id"] == stream_id),
+                "",
+            )
+            target_section = _project_stream_section(todoist_task, projects, streams, sections)
+            if target_section and notion_task.get("inbox_project_id"):
+                self.todoist.update_task_location(todoist_id, notion_task["inbox_project_id"], target_section)
+                todoist_task["project_id"] = notion_task["inbox_project_id"]
+                todoist_task["section_id"] = target_section
+            state[notion_task["page_id"]] = {
+                "notion": _fingerprint(notion_task),
+                "todoist": _fingerprint(todoist_task),
+                "todoist_id": todoist_id,
+            }
+            result.todoist_to_notion += 1
+            return
+
         prior = state.get(notion_task["page_id"], {})
         notion_fingerprint = _fingerprint(notion_task)
         todoist_fingerprint = _fingerprint(todoist_task)
@@ -574,6 +600,23 @@ class TaskSyncService:
             payload={"properties": properties},
         )
 
+    def _update_notion_routing_from_todoist(
+        self,
+        page_id: str,
+        task: dict[str, Any],
+        projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+        sections: dict[str, str],
+    ) -> None:
+        properties = _notion_routing_from_todoist(task, projects, streams, sections)
+        properties["Sync status"] = _select("Synced")
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=self.notion_headers,
+            payload={"properties": properties},
+        )
+
     def _set_notion_todoist_id(self, page_id: str, todoist_id: str, status: str) -> None:
         request_json(
             "PATCH",
@@ -675,6 +718,19 @@ def _notion_routing_from_todoist(
     streams: dict[str, dict[str, str]],
     sections: dict[str, str],
 ) -> dict[str, Any]:
+    project_id, stream_id = _routing_ids_from_todoist(task, projects, streams, sections)
+    return {
+        "Проект": _relation(project_id) if project_id else {"relation": []},
+        "Stream": _relation(stream_id) if stream_id else {"relation": []},
+    }
+
+
+def _routing_ids_from_todoist(
+    task: dict[str, Any],
+    projects: dict[str, dict[str, str]],
+    streams: dict[str, dict[str, str]],
+    sections: dict[str, str],
+) -> tuple[str | None, str | None]:
     labels = [_normalize_title(label) for label in task.get("labels") or []]
     project = next((projects[label] for label in labels if label in projects), None)
     section_id = str(task.get("section_id") or "")
@@ -682,10 +738,20 @@ def _notion_routing_from_todoist(
     stream = streams.get(section_name)
     if not stream and project and project.get("stream_id"):
         stream = next((item for item in streams.values() if item["id"] == project["stream_id"]), None)
-    return {
-        "Проект": _relation(project["id"]) if project else {"relation": []},
-        "Stream": _relation(stream["id"]) if stream else {"relation": []},
-    }
+    return (project["id"] if project else None, stream["id"] if stream else None)
+
+
+def _todoist_routing_differs(
+    notion_task: dict[str, Any],
+    todoist_task: dict[str, Any],
+    projects: dict[str, dict[str, str]],
+    streams: dict[str, dict[str, str]],
+    sections: dict[str, str],
+) -> bool:
+    project_id, stream_id = _routing_ids_from_todoist(todoist_task, projects, streams, sections)
+    return (notion_task.get("project_id") or "") != (project_id or "") or (
+        notion_task.get("stream_id") or ""
+    ) != (stream_id or "")
 
 
 def _project_stream_section(
