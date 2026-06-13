@@ -268,6 +268,7 @@ class TaskSyncTest(unittest.TestCase):
             )
             service._update_notion_from_todoist = Mock()
             event_task = {"id": "todo-1", "content": "Task", "labels": [], "section_id": "section-work"}
+            todoist.get_task.return_value = event_task
             result = service.handle_todoist_event({"event_name": "item:updated", "event_data": event_task})
             service._update_notion_from_todoist.assert_called_once_with(
                 "page-1",
@@ -276,8 +277,39 @@ class TaskSyncTest(unittest.TestCase):
                 {"работа": {"id": "stream-work", "name": "РАБОТА"}},
                 {"работа": "section-work", "прочее": "section-other"},
             )
-            todoist.get_task.assert_not_called()
+            todoist.get_task.assert_called_once_with("todo-1")
             self.assertEqual(result["action"], "upserted_in_notion")
+
+    def test_partial_webhook_loads_full_task_before_updating_notion_routing(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            service._find_notion_by_todoist_id = Mock(return_value={"page_id": "page-1"})
+            service._list_notion_projects = Mock(return_value={})
+            service._list_notion_streams = Mock(return_value={"личное": {"id": "stream-personal", "name": "ЛИЧНОЕ"}})
+            service._ensure_todoist_stream_sections = Mock(
+                return_value=("inbox-1", {"личное": "section-personal", "прочее": "section-other"}, 0)
+            )
+            service._update_notion_from_todoist = Mock()
+            full_task = {
+                "id": "todo-1",
+                "content": "Task",
+                "labels": [],
+                "section_id": "section-personal",
+            }
+            todoist.get_task.return_value = full_task
+            service.handle_todoist_event(
+                {"event_name": "item:updated", "event_data": {"id": "todo-1", "content": "Task"}}
+            )
+            service._update_notion_from_todoist.assert_called_once_with(
+                "page-1",
+                full_task,
+                {},
+                {"личное": {"id": "stream-personal", "name": "ЛИЧНОЕ"}},
+                {"личное": "section-personal", "прочее": "section-other"},
+            )
 
     def test_webhook_project_label_moves_other_task_to_project_stream(self):
         todoist = Mock(spec=TodoistClient)
@@ -302,6 +334,7 @@ class TaskSyncTest(unittest.TestCase):
                 "labels": ["Project A"],
                 "section_id": "section-other",
             }
+            todoist.get_task.return_value = event_task
             service.handle_todoist_event({"event_name": "item:updated", "event_data": event_task})
             todoist.update_task_location.assert_called_once_with("todo-1", "inbox-1", "section-business")
 

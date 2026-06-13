@@ -181,11 +181,16 @@ class TaskSyncService:
             projects = self._list_notion_projects()
             streams = self._list_notion_streams()
             inbox_project_id, sections, _ = self._ensure_todoist_stream_sections(streams)
+            # Todoist webhook payloads can omit routing fields such as section_id
+            # and labels. Always load the complete task before updating Notion,
+            # otherwise a partial event can clear routing and move the task to
+            # ПРОЧЕЕ during the next reconciliation.
+            task = self.todoist.get_task(task_id)
             if notion_task:
-                self._update_notion_from_todoist(notion_task["page_id"], data, projects, streams, sections)
+                self._update_notion_from_todoist(notion_task["page_id"], task, projects, streams, sections)
             else:
-                self._create_notion_from_todoist(data, projects, streams, sections)
-            target_section = _project_stream_section(data, projects, streams, sections)
+                self._create_notion_from_todoist(task, projects, streams, sections)
+            target_section = _project_stream_section(task, projects, streams, sections)
             if target_section:
                 self.todoist.update_task_location(task_id, inbox_project_id, target_section)
             return {"ok": True, "action": "upserted_in_notion"}

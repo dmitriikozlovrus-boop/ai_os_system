@@ -22,7 +22,7 @@ sync_loop = TaskSyncLoop(service.task_sync, settings.todoist_sync_interval_secon
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":
-            self._json(200, {"ok": True})
+            self._json(200, {"ok": True, "todoist_sync_enabled": service.task_sync.enabled})
             return
         self._json(404, {"error": "not found"})
 
