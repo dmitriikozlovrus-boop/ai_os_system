@@ -46,6 +46,7 @@ class TaskSyncService:
         state_path: str,
         completed_since: str = "2007-01-01",
         streams_database_id: str = "",
+        paused: bool = False,
     ):
         self.notion_token = notion_token
         self.tasks_database_id = tasks_database_id
@@ -54,6 +55,7 @@ class TaskSyncService:
         self.state_path = Path(state_path)
         self.completed_since = completed_since
         self.streams_database_id = streams_database_id
+        self.paused = paused
         self._lock = threading.Lock()
 
     @property
@@ -67,7 +69,8 @@ class TaskSyncService:
     @property
     def enabled(self) -> bool:
         return bool(
-            self.notion_token
+            not self.paused
+            and self.notion_token
             and self.tasks_database_id
             and self.projects_database_id
             and self.todoist.enabled
