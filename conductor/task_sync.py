@@ -107,6 +107,12 @@ class TaskSyncService:
             except Exception as exc:  # noqa: BLE001
                 completed_tasks = []
                 result.errors.append(f"Could not load completed Todoist tasks: {exc}")
+            print(
+                "Todoist sync inventory: "
+                f"notion={len(notion_tasks)}, active={len(active_tasks)}, completed={len(completed_tasks)}, "
+                f"completed_since={completed_since}",
+                flush=True,
+            )
             todoist_tasks = {str(task["id"]): task for task in [*active_tasks, *completed_tasks]}
             linked_ids = {task["todoist_id"] for task in notion_tasks if task["todoist_id"]}
             self._link_existing_matches(notion_tasks, todoist_tasks, linked_ids)
@@ -124,6 +130,7 @@ class TaskSyncService:
                         sections,
                         allow_missing_todoist_resolution=completed_history_loaded,
                     )
+                    self._persist_sync_state_to_notion(notion_task, state.get(notion_task["page_id"], {}))
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(f"{notion_task['title']}: {exc}")
                     self._mark_notion_sync(notion_task["page_id"], "Error", str(exc))
@@ -256,6 +263,7 @@ class TaskSyncService:
                 return
             created_id = self.todoist.create_task(notion_task)
             self._set_notion_todoist_id(notion_task["page_id"], str(created_id), "Synced")
+            notion_task["todoist_id"] = str(created_id)
             state[notion_task["page_id"]] = {
                 "notion": _fingerprint(notion_task),
                 "todoist": "",
@@ -290,7 +298,7 @@ class TaskSyncService:
             result.todoist_to_notion += 1
             return
 
-        prior = state.get(notion_task["page_id"], {})
+        prior = state.get(notion_task["page_id"]) or _notion_stored_state(notion_task)
         notion_fingerprint = _fingerprint(notion_task)
         todoist_fingerprint = _fingerprint(todoist_task)
         notion_changed = notion_fingerprint != prior.get("notion")
@@ -695,6 +703,28 @@ class TaskSyncService:
         state.pop(page_id, None)
         self._save_state(state)
 
+    def _persist_sync_state_to_notion(self, notion_task: dict[str, Any], entry: dict[str, str]) -> None:
+        notion_hash = str(entry.get("notion") or "")
+        todoist_hash = str(entry.get("todoist") or "")
+        if (
+            notion_hash == notion_task.get("sync_notion_hash", "")
+            and todoist_hash == notion_task.get("sync_todoist_hash", "")
+        ):
+            return
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{notion_task['page_id']}",
+            headers=self.notion_headers,
+            payload={
+                "properties": {
+                    "Sync Notion hash": _rich_text(notion_hash),
+                    "Sync Todoist hash": _rich_text(todoist_hash),
+                }
+            },
+        )
+        notion_task["sync_notion_hash"] = notion_hash
+        notion_task["sync_todoist_hash"] = todoist_hash
+
     @staticmethod
     def _notion_task(row: dict[str, Any]) -> dict[str, Any]:
         props = row.get("properties", {})
@@ -709,6 +739,8 @@ class TaskSyncService:
             "todoist_id": _plain_rich_text(props.get("Todoist ID")),
             "sync_status": _plain_select(props.get("Sync status")),
             "sync_error": _plain_rich_text(props.get("Sync error")),
+            "sync_notion_hash": _plain_rich_text(props.get("Sync Notion hash")),
+            "sync_todoist_hash": _plain_rich_text(props.get("Sync Todoist hash")),
             "project_id": _plain_relation_id(props.get("Проект")),
             "stream_id": _plain_relation_id(props.get("Stream")),
             "last_edited_time": row.get("last_edited_time", ""),
@@ -897,6 +929,18 @@ def _state_entry(notion_task: dict[str, Any], todoist_task: dict[str, Any]) -> d
         "notion": _fingerprint(notion_task),
         "todoist": _fingerprint(todoist_task),
         "todoist_id": str(todoist_task.get("id") or notion_task.get("todoist_id") or ""),
+    }
+
+
+def _notion_stored_state(notion_task: dict[str, Any]) -> dict[str, str]:
+    notion_hash = str(notion_task.get("sync_notion_hash") or "")
+    todoist_hash = str(notion_task.get("sync_todoist_hash") or "")
+    if not notion_hash and not todoist_hash:
+        return {}
+    return {
+        "notion": notion_hash,
+        "todoist": todoist_hash,
+        "todoist_id": str(notion_task.get("todoist_id") or ""),
     }
 
 

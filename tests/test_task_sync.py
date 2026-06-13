@@ -13,6 +13,7 @@ from conductor.task_sync import (
     _match_key_todoist,
     _notion_properties_from_todoist,
     _notion_routing_from_todoist,
+    _notion_stored_state,
     _parse_time,
     _project_stream_section,
     _priority_to_strategic,
@@ -52,6 +53,18 @@ class TodoistMappingTest(unittest.TestCase):
     def test_parse_time_handles_iso_and_empty_values(self):
         self.assertEqual(_parse_time("2026-06-12T10:00:00Z"), datetime(2026, 6, 12, 10, tzinfo=timezone.utc))
         self.assertEqual(_parse_time(None), datetime.min.replace(tzinfo=timezone.utc))
+
+    def test_notion_stored_hashes_restore_sync_state_after_deploy(self):
+        self.assertEqual(
+            _notion_stored_state(
+                {
+                    "todoist_id": "todo-1",
+                    "sync_notion_hash": "notion-hash",
+                    "sync_todoist_hash": "todoist-hash",
+                }
+            ),
+            {"notion": "notion-hash", "todoist": "todoist-hash", "todoist_id": "todo-1"},
+        )
 
     def test_move_to_section_does_not_also_send_project(self):
         client = TodoistClient("token", True)
@@ -223,6 +236,40 @@ class TaskSyncTest(unittest.TestCase):
             todoist.update_task.assert_not_called()
             todoist.update_task_location.assert_not_called()
             service._update_notion_from_todoist.assert_called_once()
+
+    def test_persisted_notion_hashes_prevent_fresh_deploy_bootstrap(self):
+        todoist = Mock(spec=TodoistClient)
+        todoist.enabled = True
+        todoist.api_token = "token"
+        with tempfile.TemporaryDirectory() as directory:
+            service = TaskSyncService("notion", "tasks", "projects", todoist, str(Path(directory) / "state.json"))
+            service._update_notion_from_todoist = Mock()
+            notion = {
+                "page_id": "page-1",
+                "title": "Task",
+                "description": "",
+                "status": "Backlog",
+                "priority": "P2",
+                "due_date": None,
+                "deadline": None,
+                "todoist_id": "todo-1",
+                "sync_status": "Synced",
+                "sync_error": "",
+                "last_edited_time": "2026-06-11T10:00:00Z",
+            }
+            todo = {
+                "id": "todo-1",
+                "content": "Task",
+                "description": "",
+                "priority": 3,
+                "is_completed": False,
+                "updated_at": "2026-06-11T10:00:00Z",
+            }
+            notion["sync_notion_hash"] = _fingerprint(notion)
+            notion["sync_todoist_hash"] = _fingerprint(todo)
+            service._sync_notion_task(notion, {"todo-1": todo}, {}, SyncResult(errors=[]))
+            service._update_notion_from_todoist.assert_not_called()
+            todoist.update_task.assert_not_called()
 
     def test_todoist_rate_limit_retry_after_is_honored(self):
         self.assertEqual(
