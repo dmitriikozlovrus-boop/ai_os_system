@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from conductor.http import HttpError
 from conductor.task_sync import (
+    MANAGED_TODOIST_LABELS,
     PRIMARY_SYNC_CONTRACT_VERSION,
     SyncResult,
     TaskSyncService,
@@ -16,6 +17,7 @@ from conductor.task_sync import (
     _match_key_todoist,
     _notion_properties_from_todoist,
     _notion_routing_from_todoist,
+    _notion_sync_timestamps,
     _notion_stored_state,
     _parse_time,
     _priority_to_strategic,
@@ -125,6 +127,14 @@ class TodoistMappingTest(unittest.TestCase):
             {"content": "Task", "labels": ["Project A", "анализ", "custom"]}
         )
         self.assertEqual(properties["Метки Todoist"], {"multi_select": [{"name": "анализ"}]})
+
+    def test_todoist_sync_timestamps_are_visible_in_notion(self):
+        properties = _notion_sync_timestamps(
+            {"added_at": "2026-06-15T10:00:00Z", "updated_at": "2026-06-15T11:00:00Z"}
+        )
+        self.assertEqual(properties["Todoist created at"], {"date": {"start": "2026-06-15T10:00:00Z"}})
+        self.assertEqual(properties["Todoist updated at"], {"date": {"start": "2026-06-15T11:00:00Z"}})
+        self.assertIn("Last synced at", properties)
 
     def test_existing_tasks_match_by_normalized_title_and_due_date(self):
         notion = {"title": "  Подготовить   письмо ", "due_date": "2026-06-13"}
@@ -591,6 +601,19 @@ class SafetyTest(unittest.TestCase):
         )
         sync.todoist.create_project.assert_called_once_with("A", None)
         sync._set_notion_project_sync.assert_called_once_with("p", "todo-project")
+
+    def test_todoist_primary_creates_missing_operational_labels_without_editing_tasks(self):
+        sync = service(mode="todoist-primary")
+        sync.todoist.create_label.side_effect = lambda name: f"id-{name}"
+        result = SyncResult(errors=[], mode="todoist-primary")
+        sync._ensure_todoist_labels(
+            [{"id": "existing", "name": "встреча"}, {"id": "custom", "name": "custom"}],
+            result,
+        )
+        created = {call.args[0] for call in sync.todoist.create_label.call_args_list}
+        self.assertEqual(created, MANAGED_TODOIST_LABELS - {"встреча"})
+        self.assertEqual(result.labels_created, len(MANAGED_TODOIST_LABELS) - 1)
+        sync.todoist.update_task_labels.assert_not_called()
 
     def test_project_sync_fields_include_id_status_timestamp_and_checkbox(self):
         sync = service(mode="todoist-primary")

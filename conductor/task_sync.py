@@ -140,6 +140,9 @@ class TaskSyncService:
             todoist_projects = self.todoist.list_projects()
             sections = self.todoist.list_sections()
             labels = self.todoist.list_labels()
+            if self.mode == "todoist-primary":
+                self._ensure_todoist_labels(labels, result)
+                labels = self.todoist.list_labels()
             active_tasks = self.todoist.list_tasks()
             result.inventory = {
                 "notion_tasks": len(notion_tasks),
@@ -1147,6 +1150,20 @@ class TaskSyncService:
                 result.errors.append(f"Could not sync project {project['name']}: {exc}")
                 self._mark_notion_project_error(project["id"], str(exc))
 
+    def _ensure_todoist_labels(self, labels: list[dict[str, Any]], result: SyncResult) -> None:
+        existing = {_normalize_title(label.get("name")).removeprefix("@") for label in labels}
+        for label in sorted(MANAGED_TODOIST_LABELS):
+            if label in existing:
+                continue
+            try:
+                created_id = self.todoist.create_label(label)
+                if not created_id:
+                    raise RuntimeError("Todoist did not return a label ID")
+                existing.add(label)
+                result.labels_created += 1
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"Could not create Todoist label {label}: {exc}")
+
     def _set_notion_external_id(self, page_id: str, property_name: str, value: str) -> None:
         request_json(
             "PATCH",
@@ -1245,6 +1262,7 @@ class TaskSyncService:
         properties["Todoist ID"] = _rich_text(str(task["id"]))
         properties["Sync status"] = _select("Synced")
         properties["Sync error"] = _rich_text("")
+        properties.update(_notion_sync_timestamps(task))
         properties["Source"] = _select("Todoist")
         request_json(
             "POST",
@@ -1278,6 +1296,7 @@ class TaskSyncService:
         )
         properties["Sync status"] = _select("Synced")
         properties["Sync error"] = _rich_text("")
+        properties.update(_notion_sync_timestamps(task))
         request_json(
             "PATCH",
             f"https://api.notion.com/v1/pages/{page_id}",
@@ -1481,6 +1500,7 @@ class TaskSyncService:
             "section_name": _plain_rich_text(props.get("Раздел")),
             "todoist_section_id": _plain_rich_text(props.get("Todoist Section ID")),
             "managed_labels": _plain_multi_select(props.get("Метки Todoist")),
+            "created_time": row.get("created_time", ""),
             "last_edited_time": row.get("last_edited_time", ""),
         }
 
@@ -1529,6 +1549,18 @@ def _notion_properties_from_todoist(
         "Deadline": _date(deadline.get("date")),
         "Метки Todoist": _multi_select(_managed_labels(task.get("labels") or [])),
     }
+    return properties
+
+
+def _notion_sync_timestamps(task: dict[str, Any]) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    properties = {"Last synced at": _date(now)}
+    created_at = str(task.get("added_at") or "")
+    updated_at = str(task.get("updated_at") or task.get("added_at") or "")
+    if created_at:
+        properties["Todoist created at"] = _date(created_at)
+    if updated_at:
+        properties["Todoist updated at"] = _date(updated_at)
     return properties
 
 
@@ -1711,6 +1743,10 @@ def _state_entry(notion_task: dict[str, Any], todoist_task: dict[str, Any]) -> d
         "notion": _fingerprint(notion_task),
         "todoist": _fingerprint(todoist_task),
         "todoist_id": str(todoist_task.get("id") or notion_task.get("todoist_id") or ""),
+        "notion_created_at": str(notion_task.get("created_time") or ""),
+        "notion_updated_at": str(notion_task.get("last_edited_time") or ""),
+        "todoist_created_at": str(todoist_task.get("added_at") or ""),
+        "todoist_updated_at": str(todoist_task.get("updated_at") or todoist_task.get("added_at") or ""),
     }
 
 
