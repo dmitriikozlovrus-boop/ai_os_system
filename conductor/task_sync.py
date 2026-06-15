@@ -86,7 +86,7 @@ class TaskSyncService:
         self.completed_since = completed_since
         self.streams_database_id = streams_database_id
         self.paused = paused
-        self.mode = mode if mode in {"observe", "projects", "write"} else "observe"
+        configured_mode = mode if mode in {"observe", "projects", "todoist-primary", "write"} else "observe"
         self.allow_project_create = allow_project_create
         self.allow_task_create = allow_task_create
         self.allow_task_move = allow_task_move
@@ -96,6 +96,8 @@ class TaskSyncService:
         self.max_task_moves = max(max_task_moves, 0)
         self.snapshot_path = Path(snapshot_path)
         self.report_path = self.snapshot_path.with_name(f"{self.snapshot_path.stem}_report.json")
+        self.mode_override_path = self.snapshot_path.with_name("todoist_sync_mode_override.json")
+        self.mode = self._load_mode_override() or configured_mode
         self._task_moves = 0
         self._lock = threading.Lock()
 
@@ -173,7 +175,7 @@ class TaskSyncService:
                 sections,
                 active_tasks,
             )
-            if self.mode == "observe":
+            if self.mode in {"observe", "todoist-primary"}:
                 return result.as_dict()
 
             self._ensure_todoist_project_hierarchy(projects, streams, todoist_projects, result)
@@ -266,7 +268,7 @@ class TaskSyncService:
     def handle_todoist_event(self, event: dict[str, Any]) -> dict[str, Any]:
         if not self.enabled:
             return {"ignored": True, "reason": "sync disabled"}
-        if self.mode != "write":
+        if self.mode not in {"todoist-primary", "write"}:
             return {"ignored": True, "reason": f"sync is in {self.mode} mode"}
         # Webhooks and periodic reconciliation share the same state file.
         # Serialize them so a webhook cannot be overwritten by an older sync snapshot.
@@ -280,21 +282,31 @@ class TaskSyncService:
         if not task_id:
             return {"ignored": True, "reason": "missing task id"}
         notion_task = self._find_notion_by_todoist_id(task_id)
+        todoist_primary = self.mode == "todoist-primary"
         if event_name == "item:deleted":
-            if notion_task and self.allow_missing_cancel:
+            if notion_task and (todoist_primary or self.allow_missing_cancel):
                 self._update_notion_status(notion_task["page_id"], "Cancelled")
                 self._forget_state(notion_task["page_id"])
-            return {"ok": True, "action": "cancelled_in_notion" if self.allow_missing_cancel else "deletion_observed"}
+            return {
+                "ok": True,
+                "action": "cancelled_in_notion" if todoist_primary or self.allow_missing_cancel else "deletion_observed",
+            }
         if event_name == "item:completed":
-            if notion_task and self.allow_status_write:
+            if notion_task and (todoist_primary or self.allow_status_write):
                 self._update_notion_status(notion_task["page_id"], "Done")
                 self._forget_state(notion_task["page_id"])
-            return {"ok": True, "action": "completed_in_notion" if self.allow_status_write else "completion_observed"}
+            return {
+                "ok": True,
+                "action": "completed_in_notion" if todoist_primary or self.allow_status_write else "completion_observed",
+            }
         if event_name == "item:uncompleted":
-            if notion_task and self.allow_status_write:
+            if notion_task and (todoist_primary or self.allow_status_write):
                 self._update_notion_status(notion_task["page_id"], "Backlog")
                 self._forget_state(notion_task["page_id"])
-            return {"ok": True, "action": "reopened_in_notion" if self.allow_status_write else "reopen_observed"}
+            return {
+                "ok": True,
+                "action": "reopened_in_notion" if todoist_primary or self.allow_status_write else "reopen_observed",
+            }
         if event_name in {"item:added", "item:updated"}:
             projects = self._list_notion_projects()
             streams = self._list_notion_streams()
@@ -305,6 +317,11 @@ class TaskSyncService:
             # otherwise a partial event can clear routing and move the task to
             # ПРОЧЕЕ during the next reconciliation.
             task = self.todoist.get_task(task_id)
+            project_id, _, _, _ = _routing_ids_from_todoist(
+                task, projects, streams, todoist_projects, sections
+            )
+            if todoist_primary and not project_id:
+                return {"ignored": True, "reason": "Todoist task is not in a mapped project"}
             if notion_task:
                 self._update_notion_from_todoist(
                     notion_task["page_id"],
@@ -314,9 +331,17 @@ class TaskSyncService:
                     todoist_projects,
                     sections,
                     current_status=notion_task.get("status"),
+                    force_status_write=todoist_primary,
                 )
             else:
-                self._create_notion_from_todoist(task, projects, streams, todoist_projects, sections)
+                self._create_notion_from_todoist(
+                    task,
+                    projects,
+                    streams,
+                    todoist_projects,
+                    sections,
+                    force_status_write=todoist_primary,
+                )
             if notion_task:
                 _apply_todoist_snapshot_to_notion(notion_task, task, projects, streams, todoist_projects, sections)
                 self._remember_state(notion_task, task)
@@ -870,9 +895,10 @@ class TaskSyncService:
         streams: dict[str, dict[str, str]] | None = None,
         todoist_projects: list[dict[str, Any]] | None = None,
         sections: list[dict[str, Any]] | None = None,
+        force_status_write: bool = False,
     ) -> None:
         properties = _notion_properties_from_todoist(task)
-        if not self.allow_status_write:
+        if not force_status_write and not self.allow_status_write:
             properties.pop("Статус", None)
         properties.update(
             _notion_routing_from_todoist(
@@ -903,9 +929,10 @@ class TaskSyncService:
         todoist_projects: list[dict[str, Any]] | None = None,
         sections: list[dict[str, Any]] | None = None,
         current_status: str | None = None,
+        force_status_write: bool = False,
     ) -> None:
         properties = _notion_properties_from_todoist(task, current_status=current_status)
-        if not self.allow_status_write:
+        if not force_status_write and not self.allow_status_write:
             properties.pop("Статус", None)
         properties.update(
             _notion_routing_from_todoist(
@@ -984,6 +1011,21 @@ class TaskSyncService:
             return json.loads(self.state_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
+
+    def _load_mode_override(self) -> str:
+        try:
+            mode = str(json.loads(self.mode_override_path.read_text(encoding="utf-8")).get("mode") or "")
+        except (FileNotFoundError, json.JSONDecodeError):
+            return ""
+        return mode if mode in {"observe", "projects", "todoist-primary", "write"} else ""
+
+    def set_runtime_mode(self, mode: str) -> str:
+        if mode not in {"observe", "projects", "todoist-primary", "write"}:
+            raise ValueError(f"Unsupported sync mode: {mode}")
+        self.mode_override_path.parent.mkdir(parents=True, exist_ok=True)
+        self.mode_override_path.write_text(json.dumps({"mode": mode}), encoding="utf-8")
+        self.mode = mode
+        return self.mode
 
     def _save_state(self, state: dict[str, Any]) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)

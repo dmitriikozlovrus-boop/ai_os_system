@@ -165,6 +165,45 @@ class SafetyTest(unittest.TestCase):
         result = sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
         self.assertEqual(result["reason"], "sync is in projects mode")
 
+    def test_todoist_primary_ignores_tasks_outside_mapped_projects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sync = service(mode="todoist-primary", directory=directory)
+            sync._find_notion_by_todoist_id = Mock(return_value={"page_id": "p-1", "status": "Backlog"})
+            sync._list_notion_projects = Mock(return_value={})
+            sync._list_notion_streams = Mock(return_value={})
+            sync.todoist.list_projects.return_value = [{"id": "inbox", "name": "Inbox"}]
+            sync.todoist.list_sections.return_value = []
+            sync.todoist.get_task.return_value = {"id": "t-1", "project_id": "inbox"}
+            sync._update_notion_from_todoist = Mock()
+            result = sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
+        self.assertEqual(result["reason"], "Todoist task is not in a mapped project")
+        sync._update_notion_from_todoist.assert_not_called()
+
+    def test_todoist_primary_updates_notion_for_mapped_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sync = service(mode="todoist-primary", directory=directory)
+            notion_task = {"page_id": "p-1", "status": "Backlog"}
+            sync._find_notion_by_todoist_id = Mock(return_value=notion_task)
+            sync._list_notion_projects = Mock(
+                return_value={"a": {"id": "np-1", "name": "A", "stream_id": "", "todoist_project_id": "tp-1"}}
+            )
+            sync._list_notion_streams = Mock(return_value={})
+            sync.todoist.list_projects.return_value = [{"id": "tp-1", "name": "A"}]
+            sync.todoist.list_sections.return_value = []
+            sync.todoist.get_task.return_value = {"id": "t-1", "project_id": "tp-1"}
+            sync._update_notion_from_todoist = Mock()
+            sync._remember_state = Mock()
+            result = sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
+        self.assertEqual(result["action"], "upserted_in_notion")
+        self.assertTrue(sync._update_notion_from_todoist.call_args.kwargs["force_status_write"])
+
+    def test_runtime_mode_override_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sync = service(mode="observe", directory=directory)
+            sync.set_runtime_mode("todoist-primary")
+            restarted = service(mode="observe", directory=directory)
+        self.assertEqual(restarted.mode, "todoist-primary")
+
     def test_missing_task_is_not_cancelled_by_default(self):
         sync = service(mode="write")
         sync._update_notion_status = Mock()
