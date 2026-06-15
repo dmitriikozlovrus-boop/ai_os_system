@@ -1027,6 +1027,72 @@ class TaskSyncService:
         self.mode = mode
         return self.mode
 
+    def move_labeled_inbox_tasks(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {"moved": 0, "errors": ["Todoist sync is not configured"]}
+        if not self._lock.acquire(blocking=False):
+            return {"moved": 0, "errors": ["Todoist sync is already running"]}
+        previous_mode = self.mode
+        try:
+            # Ignore Todoist webhooks triggered by this one-time move so this
+            # operation changes only task location in Todoist.
+            self.mode = "observe"
+            projects = self._list_notion_projects()
+            todoist_projects = self.todoist.list_projects()
+            active_tasks = self.todoist.list_tasks()
+            inbox_ids = {
+                str(project.get("id") or "")
+                for project in todoist_projects
+                if project.get("is_inbox_project") or _normalize_title(project.get("name")) == "inbox"
+            }
+            mapped_by_label: dict[str, set[str]] = {}
+            project_names: dict[str, str] = {}
+            for project in projects.values():
+                todoist_project_id = str(project.get("todoist_project_id") or "")
+                if not todoist_project_id:
+                    continue
+                mapped_by_label.setdefault(_normalize_title(project.get("name")), set()).add(todoist_project_id)
+                project_names[todoist_project_id] = str(project.get("name") or "")
+
+            moves: list[tuple[str, str]] = []
+            ambiguous = 0
+            without_project_label = 0
+            for task in active_tasks:
+                if str(task.get("project_id") or "") not in inbox_ids:
+                    continue
+                targets = {
+                    target
+                    for label in task.get("labels") or []
+                    for target in mapped_by_label.get(_normalize_title(label), set())
+                }
+                if len(targets) == 1:
+                    moves.append((str(task.get("id") or ""), targets.pop()))
+                elif targets:
+                    ambiguous += 1
+                else:
+                    without_project_label += 1
+
+            errors: list[str] = []
+            moved_by_project: dict[str, int] = {}
+            for task_id, project_id in moves:
+                try:
+                    self.todoist.update_task_location(task_id, project_id, None)
+                    moved_by_project[project_names.get(project_id, project_id)] = (
+                        moved_by_project.get(project_names.get(project_id, project_id), 0) + 1
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{task_id}: {exc}")
+            return {
+                "moved": len(moves) - len(errors),
+                "ambiguous": ambiguous,
+                "left_without_project_label": without_project_label,
+                "moved_by_project": moved_by_project,
+                "errors": errors,
+            }
+        finally:
+            self.mode = previous_mode
+            self._lock.release()
+
     def _save_state(self, state: dict[str, Any]) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")

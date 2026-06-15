@@ -204,6 +204,29 @@ class SafetyTest(unittest.TestCase):
             restarted = service(mode="observe", directory=directory)
         self.assertEqual(restarted.mode, "todoist-primary")
 
+    def test_move_labeled_inbox_tasks_only_moves_unique_project_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sync = service(mode="todoist-primary", directory=directory)
+            sync._list_notion_projects = Mock(
+                return_value={
+                    "a": {"name": "Project A", "todoist_project_id": "tp-a"},
+                    "b": {"name": "Project B", "todoist_project_id": "tp-b"},
+                }
+            )
+            sync.todoist.list_projects.return_value = [{"id": "inbox", "name": "Inbox", "is_inbox_project": True}]
+            sync.todoist.list_tasks.return_value = [
+                {"id": "move", "project_id": "inbox", "labels": ["Project A", "звонок"]},
+                {"id": "ambiguous", "project_id": "inbox", "labels": ["Project A", "Project B"]},
+                {"id": "unmatched", "project_id": "inbox", "labels": ["звонок"]},
+                {"id": "already-moved", "project_id": "tp-a", "labels": ["Project B"]},
+            ]
+            result = sync.move_labeled_inbox_tasks()
+        self.assertEqual(result["moved"], 1)
+        self.assertEqual(result["ambiguous"], 1)
+        self.assertEqual(result["left_without_project_label"], 1)
+        sync.todoist.update_task_location.assert_called_once_with("move", "tp-a", None)
+        self.assertEqual(sync.mode, "todoist-primary")
+
     def test_missing_task_is_not_cancelled_by_default(self):
         sync = service(mode="write")
         sync._update_notion_status = Mock()
