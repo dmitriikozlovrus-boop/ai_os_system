@@ -1,6 +1,7 @@
 # Conductor / Дирижер MVP
 
-Минимальный сервис для Telegram-бота "Люба": принимает текст или голос, классифицирует поток на задачи и вопросы на изучение, записывает результат в Notion, а Todoist держит как следующий подключаемый слой.
+Сервис для Telegram-бота "Люба" и двусторонней синхронизации задач Notion ↔ Todoist.
+Todoist используется как основной рабочий интерфейс, а Notion — как общая база задач для Любы и будущих агентов.
 
 ## Что уже поддержано
 
@@ -189,7 +190,6 @@ TELEGRAM_BOT_TOKEN=... PUBLIC_BASE_URL=https://YOUR_DOMAIN sh deploy/set_webhook
 - `NOTION_TASKS_DATABASE_ID`
 - `NOTION_STUDY_DATABASE_ID`
 - `NOTION_PROJECTS_DATABASE_ID`
-- `TODOIST_API_TOKEN` настроен
 - `TODOIST_API_TOKEN`
 - `TODOIST_WEBHOOK_SECRET`
 - `TASK_SYNC_SECRET`

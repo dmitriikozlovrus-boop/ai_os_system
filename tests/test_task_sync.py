@@ -150,6 +150,63 @@ class TodoistMappingTest(unittest.TestCase):
 
 
 class SafetyTest(unittest.TestCase):
+    def test_stable_primary_sync_does_not_refetch_unchanged_todoist_catalogs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sync = service(mode="todoist-primary", directory=directory)
+            sync._list_notion_tasks = Mock(return_value=[])
+            sync._list_notion_projects = Mock(return_value={})
+            sync._list_notion_streams = Mock(return_value={})
+            sync.todoist.list_projects.return_value = []
+            sync.todoist.list_sections.return_value = []
+            sync.todoist.list_labels.return_value = [
+                {"id": name, "name": name} for name in MANAGED_TODOIST_LABELS
+            ]
+            sync.todoist.list_tasks.return_value = []
+            sync.todoist.list_completed_tasks.return_value = []
+            result = sync.sync()
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(sync.todoist.list_projects.call_count, 1)
+        self.assertEqual(sync.todoist.list_labels.call_count, 1)
+
+    def test_todoist_snapshot_combines_task_and_hashes_in_one_notion_patch(self):
+        sync = service(mode="todoist-primary")
+        notion = {
+            "page_id": "p-1",
+            "title": "Old",
+            "status": "Backlog",
+            "todoist_id": "t-1",
+            "managed_labels": [],
+        }
+        todo = {"id": "t-1", "content": "Current", "project_id": "inbox", "labels": []}
+        with patch("conductor.task_sync.request_json") as request:
+            entry = sync._write_todoist_snapshot_to_notion(
+                notion,
+                todo,
+                {},
+                {},
+                [{"id": "inbox", "name": "Inbox", "is_inbox_project": True}],
+                [],
+            )
+            sync._persist_sync_state_to_notion(notion, entry)
+        self.assertEqual(request.call_count, 1)
+        properties = request.call_args.kwargs["payload"]["properties"]
+        self.assertIn("Task", properties)
+        self.assertIn("Sync Notion hash", properties)
+        self.assertIn("Sync Todoist hash", properties)
+
+    def test_notion_database_pagination_is_shared_and_complete(self):
+        sync = service(mode="observe")
+        with patch(
+            "conductor.task_sync.request_json",
+            side_effect=[
+                {"results": [{"id": "1"}], "has_more": True, "next_cursor": "next"},
+                {"results": [{"id": "2"}], "has_more": False},
+            ],
+        ) as request:
+            rows = sync._query_notion_database("database")
+        self.assertEqual([row["id"] for row in rows], ["1", "2"])
+        self.assertEqual(request.call_args_list[1].kwargs["payload"]["start_cursor"], "next")
+
     def test_observe_mode_writes_snapshot_and_performs_no_remote_writes(self):
         todoist = Mock(spec=TodoistClient)
         todoist.enabled = True

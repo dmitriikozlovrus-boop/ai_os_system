@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from conductor.models import classification_from_dict, normalize_effort
+from conductor.notion_client import NotionClient
 from conductor.openai_client import OpenAIClient
 from conductor.service import (
     ConductorService,
@@ -13,6 +14,25 @@ from conductor.service import (
 
 
 class ModelsTest(unittest.TestCase):
+    def test_notion_project_lookup_reuses_supplied_catalog(self):
+        client = NotionClient("token", "tasks", "study", "projects")
+        client.list_projects = Mock(side_effect=AssertionError("catalog should not be reloaded"))
+
+        project_id = client._find_project_id(
+            " сырьевой   трейдинг ",
+            projects=[{"id": "project-id", "name": "СЫРЬЕВОЙ ТРЕЙДИНГ"}],
+        )
+
+        self.assertEqual(project_id, "project-id")
+        client.list_projects.assert_not_called()
+
+    def test_notion_project_lookup_loads_catalog_as_fallback(self):
+        client = NotionClient("token", "tasks", "study", "projects")
+        client.list_projects = Mock(return_value=[{"id": "project-id", "name": "Проект"}])
+
+        self.assertEqual(client._find_project_id("проект"), "project-id")
+        client.list_projects.assert_called_once_with()
+
     def test_normalize_effort(self):
         self.assertEqual(normalize_effort(5), "5m")
         self.assertEqual(normalize_effort(14), "15m")

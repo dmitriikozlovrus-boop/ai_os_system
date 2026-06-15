@@ -48,8 +48,14 @@ class NotionClient:
             )
         return [p for p in projects if p["name"]]
 
-    def create_task(self, item: TaskItem, *, source: str = "Telegram") -> str:
-        project_id = self._find_project_id(item.project)
+    def create_task(
+        self,
+        item: TaskItem,
+        *,
+        source: str = "Telegram",
+        projects: list[dict[str, str]] | None = None,
+    ) -> str:
+        project_id = self._find_project_id(item.project, projects=projects)
         payload = {
             "parent": {"database_id": self.tasks_db},
             "properties": _task_properties(item, project_id=project_id),
@@ -63,8 +69,14 @@ class NotionClient:
         data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
         return data.get("url", "")
 
-    def update_task(self, page_id: str, item: TaskItem) -> None:
-        project_id = self._find_project_id(item.project)
+    def update_task(
+        self,
+        page_id: str,
+        item: TaskItem,
+        *,
+        projects: list[dict[str, str]] | None = None,
+    ) -> None:
+        project_id = self._find_project_id(item.project, projects=projects)
         request_json(
             "PATCH",
             f"https://api.notion.com/v1/pages/{page_id}",
@@ -80,11 +92,16 @@ class NotionClient:
             payload={"properties": _study_properties(item)},
         )
 
-    def _find_project_id(self, name: str | None) -> str | None:
+    def _find_project_id(
+        self,
+        name: str | None,
+        *,
+        projects: list[dict[str, str]] | None = None,
+    ) -> str | None:
         if not name:
             return None
         normalized = " ".join(name.casefold().split())
-        for project in self.list_projects():
+        for project in projects if projects is not None else self.list_projects():
             if " ".join(project["name"].casefold().split()) == normalized:
                 return project["id"]
         return None
@@ -199,10 +216,6 @@ def _effort(minutes: int | None) -> str | None:
 
 def _area(value: str | None) -> str:
     return value if value in {"Работа", "Бизнес", "Личное развитие", "Семья", "Прочее"} else "Прочее"
-
-
-def _area_for_tasks(value: str | None) -> str:
-    return value if value in {"Работа", "Бизнес", "Личное развитие", "Семья"} else "Операционка"
 
 
 def _research_type(value: str | None) -> str:

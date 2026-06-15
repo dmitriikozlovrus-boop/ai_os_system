@@ -78,6 +78,7 @@ class ConductorService:
                     resolved,
                     chat_id=chat_id,
                     source=source,
+                    projects=projects,
                     from_clarification=True,
                 )
             text = _merge_pending_text(pending_item, text)
@@ -93,6 +94,7 @@ class ConductorService:
             classification,
             chat_id=chat_id,
             source=source,
+            projects=projects,
             from_clarification=bool(pending_item),
         )
 
@@ -137,7 +139,7 @@ class ConductorService:
         try:
             if updated["type"] == "task":
                 item = TaskItem(**updated["item"])
-                self.notion.update_task(updated["page_id"], item)
+                self.notion.update_task(updated["page_id"], item, projects=projects)
                 classification = Classification(tasks=[item], studies=[], notes=["edited recent task"])
             else:
                 item = StudyItem(**updated["item"])
@@ -156,6 +158,7 @@ class ConductorService:
         *,
         chat_id: int | None,
         source: str,
+        projects: list[dict[str, str]] | None = None,
         from_clarification: bool = False,
     ) -> dict[str, Any]:
         created_tasks: list[str] = []
@@ -171,7 +174,7 @@ class ConductorService:
                 self.telegram.send_message(chat_id, _format_questions(item.title, questions))
                 continue
             try:
-                url = self.notion.create_task(item, source=source)
+                url = self.notion.create_task(item, source=source, projects=projects)
                 created_tasks.append(url)
                 if chat_id is not None:
                     self.recent.save(chat_id, _recent_payload("task", url, item.__dict__))
