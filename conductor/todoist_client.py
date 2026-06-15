@@ -239,7 +239,7 @@ class TodoistClient:
             "POST",
             f"{API_BASE}/tasks/{task_id}",
             headers=self.headers,
-            payload=_task_payload(item),
+            payload=_task_payload(item, include_empty_dates=True),
         )
 
     def update_task_labels(self, task_id: str, labels: list[str]) -> None:
@@ -281,7 +281,7 @@ class TodoistClient:
         return items
 
 
-def _task_payload(item: TaskItem | dict[str, Any]) -> dict[str, Any]:
+def _task_payload(item: TaskItem | dict[str, Any], *, include_empty_dates: bool = False) -> dict[str, Any]:
     if isinstance(item, TaskItem):
         title = item.title
         description = item.description
@@ -301,8 +301,12 @@ def _task_payload(item: TaskItem | dict[str, Any]) -> dict[str, Any]:
     }
     if due_date:
         payload["due_date"] = due_date
+    elif include_empty_dates:
+        payload["due_date"] = None
     if deadline:
         payload["deadline_date"] = deadline
+    elif include_empty_dates:
+        payload["deadline_date"] = None
     labels = item.get("labels") if isinstance(item, dict) else None
     if isinstance(item, dict) and "managed_labels" in item:
         labels = item.get("managed_labels") or []

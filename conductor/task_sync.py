@@ -26,7 +26,10 @@ MANAGED_TODOIST_LABELS = {
     "средняя_энергия",
     "высокая_энергия",
     "пятиминутное_дело",
+    "проверить_завершение",
 }
+COMPLETION_REVIEW_LABEL = "проверить_завершение"
+PRIMARY_SYNC_CONTRACT_VERSION = 2
 
 
 @dataclass
@@ -129,6 +132,7 @@ class TaskSyncService:
             result.errors.append("Todoist sync is already running")
             return result.as_dict()
         try:
+            self._task_moves = 0
             state = self._load_state()
             notion_tasks = self._list_notion_tasks()
             streams = self._list_notion_streams()
@@ -185,10 +189,39 @@ class TaskSyncService:
                 result,
                 force=self.mode == "todoist-primary",
             )
-            if self.mode in {"projects", "todoist-primary"}:
+            if self.mode == "projects":
                 return result.as_dict()
             todoist_projects = self.todoist.list_projects()
             self._attach_notion_routing(notion_tasks, projects, streams, todoist_projects, sections)
+            if self.mode == "todoist-primary":
+                primary_bootstrap = (
+                    state.get("__meta__", {}).get("primary_sync_contract_version") != PRIMARY_SYNC_CONTRACT_VERSION
+                )
+                completed_tasks: list[dict[str, Any]] = []
+                try:
+                    completed_tasks = self.todoist.list_completed_tasks(
+                        (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    result.errors.append(f"Could not load recent completed Todoist tasks: {exc}")
+                self._sync_todoist_primary(
+                    notion_tasks,
+                    [*active_tasks, *completed_tasks],
+                    state,
+                    result,
+                    projects,
+                    streams,
+                    todoist_projects,
+                    sections,
+                    bootstrap=primary_bootstrap,
+                )
+                state["__meta__"] = {
+                    **state.get("__meta__", {}),
+                    "last_successful_sync": datetime.now(timezone.utc).isoformat(),
+                    "primary_sync_contract_version": PRIMARY_SYNC_CONTRACT_VERSION,
+                }
+                self._save_state(state)
+                return result.as_dict()
             meta = state.get("__meta__", {})
             history_imported = bool(meta.get("completed_history_imported"))
             completed_since = (
@@ -323,22 +356,41 @@ class TaskSyncService:
             # otherwise a partial event can clear routing and move the task to
             # ПРОЧЕЕ during the next reconciliation.
             task = self.todoist.get_task(task_id)
-            project_id, _, _, _ = _routing_ids_from_todoist(
-                task, projects, streams, todoist_projects, sections
-            )
-            if todoist_primary and not project_id:
-                return {"ignored": True, "reason": "Todoist task is not in a mapped project"}
             if notion_task:
-                self._update_notion_from_todoist(
-                    notion_task["page_id"],
-                    task,
-                    projects,
-                    streams,
-                    todoist_projects,
-                    sections,
-                    current_status=notion_task.get("status"),
-                    force_status_write=todoist_primary,
-                )
+                if todoist_primary:
+                    state = self._load_state()
+                    self._attach_notion_routing([notion_task], projects, streams, todoist_projects, sections)
+                    if (
+                        state.get("__meta__", {}).get("primary_sync_contract_version")
+                        == PRIMARY_SYNC_CONTRACT_VERSION
+                    ):
+                        self._reconcile_primary_linked_task(
+                            notion_task,
+                            task,
+                            state,
+                            SyncResult(errors=[], mode=self.mode),
+                            projects,
+                            streams,
+                            todoist_projects,
+                            sections,
+                        )
+                    else:
+                        self._write_todoist_snapshot_to_notion(
+                            notion_task, task, projects, streams, todoist_projects, sections
+                        )
+                        state[notion_task["page_id"]] = _state_entry(notion_task, task)
+                    self._persist_sync_state_to_notion(notion_task, state[notion_task["page_id"]])
+                    self._save_state(state)
+                else:
+                    self._update_notion_from_todoist(
+                        notion_task["page_id"],
+                        task,
+                        projects,
+                        streams,
+                        todoist_projects,
+                        sections,
+                        current_status=notion_task.get("status"),
+                    )
             else:
                 self._create_notion_from_todoist(
                     task,
@@ -348,11 +400,249 @@ class TaskSyncService:
                     sections,
                     force_status_write=todoist_primary,
                 )
-            if notion_task:
+            if notion_task and not todoist_primary:
                 _apply_todoist_snapshot_to_notion(notion_task, task, projects, streams, todoist_projects, sections)
                 self._remember_state(notion_task, task)
             return {"ok": True, "action": "upserted_in_notion"}
         return {"ignored": True, "reason": f"unsupported event {event_name}"}
+
+    def _sync_todoist_primary(
+        self,
+        notion_tasks: list[dict[str, Any]],
+        todoist_task_list: list[dict[str, Any]],
+        state: dict[str, Any],
+        result: SyncResult,
+        projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+        todoist_projects: list[dict[str, Any]],
+        sections: list[dict[str, Any]],
+        *,
+        bootstrap: bool = False,
+    ) -> None:
+        """Reconcile all active tasks while keeping Todoist as the safe bootstrap authority."""
+        todoist_tasks = {str(task["id"]): task for task in todoist_task_list}
+        linked_ids = {task["todoist_id"] for task in notion_tasks if task["todoist_id"]}
+        self._link_existing_matches(notion_tasks, todoist_tasks, linked_ids)
+
+        for notion_task in notion_tasks:
+            try:
+                todoist_id = str(notion_task.get("todoist_id") or "")
+                if not todoist_id:
+                    if notion_task.get("status") in {"Done", "Cancelled"}:
+                        continue
+                    created_id = self.todoist.create_task(notion_task)
+                    if not created_id:
+                        raise RuntimeError("Todoist did not return a task ID")
+                    todoist_id = str(created_id)
+                    notion_task["todoist_id"] = todoist_id
+                    self._set_notion_todoist_id(notion_task["page_id"], todoist_id, "Synced")
+                    result.notion_to_todoist += 1
+                    continue
+
+                todoist_task = todoist_tasks.get(todoist_id)
+                if not todoist_task:
+                    # A webhook can distinguish deletion from completion. A periodic
+                    # active-task snapshot cannot, so it must never guess and cancel.
+                    continue
+                if bootstrap:
+                    self._write_todoist_snapshot_to_notion(
+                        notion_task,
+                        todoist_task,
+                        projects,
+                        streams,
+                        todoist_projects,
+                        sections,
+                    )
+                    state[notion_task["page_id"]] = _state_entry(notion_task, todoist_task)
+                    self._persist_sync_state_to_notion(notion_task, state[notion_task["page_id"]])
+                    result.todoist_to_notion += 1
+                    continue
+                self._reconcile_primary_linked_task(
+                    notion_task,
+                    todoist_task,
+                    state,
+                    result,
+                    projects,
+                    streams,
+                    todoist_projects,
+                    sections,
+                )
+                self._persist_sync_state_to_notion(notion_task, state.get(notion_task["page_id"], {}))
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"{notion_task.get('title') or notion_task.get('page_id')}: {exc}")
+                self._mark_notion_sync(notion_task["page_id"], "Error", str(exc))
+
+        for todoist_id, todoist_task in todoist_tasks.items():
+            if todoist_id in linked_ids:
+                continue
+            try:
+                self._create_notion_from_todoist(
+                    todoist_task,
+                    projects,
+                    streams,
+                    todoist_projects,
+                    sections,
+                    force_status_write=True,
+                )
+                result.todoist_to_notion += 1
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"Todoist {todoist_id}: {exc}")
+
+    def _reconcile_primary_linked_task(
+        self,
+        notion_task: dict[str, Any],
+        todoist_task: dict[str, Any],
+        state: dict[str, Any],
+        result: SyncResult,
+        projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+        todoist_projects: list[dict[str, Any]],
+        sections: list[dict[str, Any]],
+    ) -> None:
+        prior = state.get(notion_task["page_id"]) or _notion_stored_state(notion_task)
+        notion_changed = _fingerprint(notion_task) != prior.get("notion")
+        todoist_changed = _fingerprint(todoist_task) != prior.get("todoist")
+
+        if not prior:
+            self._write_todoist_snapshot_to_notion(
+                notion_task, todoist_task, projects, streams, todoist_projects, sections
+            )
+            result.todoist_to_notion += 1
+        elif notion_task.get("status") in {"Done", "Cancelled"} and not todoist_task.get("is_completed"):
+            notion_is_latest = not todoist_changed or _parse_time(notion_task.get("last_edited_time")) > _parse_time(
+                todoist_task.get("updated_at") or todoist_task.get("added_at")
+            )
+            if notion_changed and notion_is_latest:
+                self._update_todoist_from_notion_primary(notion_task, todoist_task, todoist_projects)
+                self._request_completion_review(notion_task, todoist_task)
+                result.notion_to_todoist += 1
+            elif todoist_changed:
+                self._write_todoist_snapshot_to_notion(
+                    notion_task, todoist_task, projects, streams, todoist_projects, sections
+                )
+                result.todoist_to_notion += 1
+        elif todoist_changed and not notion_changed:
+            self._write_todoist_snapshot_to_notion(
+                notion_task, todoist_task, projects, streams, todoist_projects, sections
+            )
+            result.todoist_to_notion += 1
+        elif notion_changed and not todoist_changed:
+            self._update_todoist_from_notion_primary(notion_task, todoist_task, todoist_projects)
+            result.notion_to_todoist += 1
+        elif notion_changed and todoist_changed:
+            if _parse_time(todoist_task.get("updated_at") or todoist_task.get("added_at")) >= _parse_time(
+                notion_task.get("last_edited_time")
+            ):
+                self._write_todoist_snapshot_to_notion(
+                    notion_task, todoist_task, projects, streams, todoist_projects, sections
+                )
+                result.todoist_to_notion += 1
+            else:
+                self._update_todoist_from_notion_primary(notion_task, todoist_task, todoist_projects)
+                result.notion_to_todoist += 1
+        elif notion_task.get("sync_status") == "Review required":
+            pass
+        elif notion_task.get("sync_status") != "Synced" or notion_task.get("sync_error"):
+            self._mark_notion_sync(notion_task["page_id"], "Synced")
+
+        state[notion_task["page_id"]] = _state_entry(notion_task, todoist_task)
+
+    def _write_todoist_snapshot_to_notion(
+        self,
+        notion_task: dict[str, Any],
+        todoist_task: dict[str, Any],
+        projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+        todoist_projects: list[dict[str, Any]],
+        sections: list[dict[str, Any]],
+    ) -> None:
+        self._update_notion_from_todoist(
+            notion_task["page_id"],
+            todoist_task,
+            projects,
+            streams,
+            todoist_projects,
+            sections,
+            current_status=notion_task.get("status"),
+            force_status_write=True,
+        )
+        _apply_todoist_snapshot_to_notion(
+            notion_task, todoist_task, projects, streams, todoist_projects, sections
+        )
+
+    def _update_todoist_from_notion_primary(
+        self,
+        notion_task: dict[str, Any],
+        todoist_task: dict[str, Any],
+        todoist_projects: list[dict[str, Any]],
+    ) -> None:
+        base_fields = dict(notion_task)
+        base_fields.pop("managed_labels", None)
+        base_fields.pop("todoist_project_id", None)
+        base_fields.pop("todoist_section_id", None)
+        self.todoist.update_task(notion_task["todoist_id"], base_fields)
+
+        existing_labels = list(todoist_task.get("labels") or [])
+        unmanaged_labels = [label for label in existing_labels if not _is_managed_label(label)]
+        expected_labels = sorted(set([*unmanaged_labels, *notion_task.get("managed_labels", [])]))
+        if sorted(existing_labels) != expected_labels:
+            self.todoist.update_task_labels(notion_task["todoist_id"], expected_labels)
+            todoist_task["labels"] = expected_labels
+
+        expected_project = str(notion_task.get("todoist_project_id") or "")
+        if not expected_project:
+            expected_project = next(
+                (
+                    str(project.get("id") or "")
+                    for project in todoist_projects
+                    if project.get("is_inbox_project") or _normalize_title(project.get("name")) == "inbox"
+                ),
+                "",
+            )
+        expected_section = str(notion_task.get("todoist_section_id") or "")
+        if expected_project and (
+            str(todoist_task.get("project_id") or "") != expected_project
+            or str(todoist_task.get("section_id") or "") != expected_section
+        ):
+            if self._task_moves >= self.max_task_moves:
+                raise RuntimeError(f"Todoist task move limit reached ({self.max_task_moves})")
+            self.todoist.update_task_location(notion_task["todoist_id"], expected_project, expected_section or None)
+            self._task_moves += 1
+            todoist_task["project_id"] = expected_project
+            todoist_task["section_id"] = expected_section or None
+        todoist_completed = bool(todoist_task.get("is_completed"))
+        _apply_notion_snapshot_to_todoist(todoist_task, notion_task)
+        # Primary-mode Notion updates never close Todoist. Completion requires
+        # the user's second key in Todoist.
+        todoist_task["is_completed"] = todoist_completed
+        self._mark_notion_sync(notion_task["page_id"], "Synced")
+
+    def _request_completion_review(
+        self,
+        notion_task: dict[str, Any],
+        todoist_task: dict[str, Any],
+    ) -> None:
+        labels = sorted(set([*(todoist_task.get("labels") or []), COMPLETION_REVIEW_LABEL]))
+        if labels != sorted(todoist_task.get("labels") or []):
+            self.todoist.update_task_labels(notion_task["todoist_id"], labels)
+        todoist_task["labels"] = labels
+        notion_task["status"] = "Waiting"
+        notion_task["managed_labels"] = _managed_labels(labels)
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{notion_task['page_id']}",
+            headers=self.notion_headers,
+            payload={
+                "properties": {
+                    "Статус": _status("Waiting"),
+                    "Метки Todoist": _multi_select(notion_task["managed_labels"]),
+                    "Sync status": _select("Review required"),
+                    "Sync error": _rich_text(
+                        "Завершение запрошено в Notion. Подтвердите закрытием задачи в Todoist."
+                    ),
+                }
+            },
+        )
 
     def _sync_notion_task(
         self,

@@ -165,19 +165,22 @@ class SafetyTest(unittest.TestCase):
         result = sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
         self.assertEqual(result["reason"], "sync is in projects mode")
 
-    def test_todoist_primary_ignores_tasks_outside_mapped_projects(self):
+    def test_todoist_primary_updates_inbox_task_and_clears_notion_routing(self):
         with tempfile.TemporaryDirectory() as directory:
             sync = service(mode="todoist-primary", directory=directory)
-            sync._find_notion_by_todoist_id = Mock(return_value={"page_id": "p-1", "status": "Backlog"})
+            notion_task = {"page_id": "p-1", "status": "Backlog"}
+            sync._find_notion_by_todoist_id = Mock(return_value=notion_task)
             sync._list_notion_projects = Mock(return_value={})
             sync._list_notion_streams = Mock(return_value={})
             sync.todoist.list_projects.return_value = [{"id": "inbox", "name": "Inbox"}]
             sync.todoist.list_sections.return_value = []
             sync.todoist.get_task.return_value = {"id": "t-1", "project_id": "inbox"}
-            sync._update_notion_from_todoist = Mock()
+            sync._write_todoist_snapshot_to_notion = Mock()
+            sync._persist_sync_state_to_notion = Mock()
+            sync._save_state = Mock()
             result = sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
-        self.assertEqual(result["reason"], "Todoist task is not in a mapped project")
-        sync._update_notion_from_todoist.assert_not_called()
+        self.assertEqual(result["action"], "upserted_in_notion")
+        sync._write_todoist_snapshot_to_notion.assert_called_once()
 
     def test_todoist_primary_updates_notion_for_mapped_project(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -191,11 +194,222 @@ class SafetyTest(unittest.TestCase):
             sync.todoist.list_projects.return_value = [{"id": "tp-1", "name": "A"}]
             sync.todoist.list_sections.return_value = []
             sync.todoist.get_task.return_value = {"id": "t-1", "project_id": "tp-1"}
-            sync._update_notion_from_todoist = Mock()
-            sync._remember_state = Mock()
+            sync._write_todoist_snapshot_to_notion = Mock()
+            sync._persist_sync_state_to_notion = Mock()
+            sync._save_state = Mock()
             result = sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
         self.assertEqual(result["action"], "upserted_in_notion")
-        self.assertTrue(sync._update_notion_from_todoist.call_args.kwargs["force_status_write"])
+        sync._write_todoist_snapshot_to_notion.assert_called_once()
+
+    def test_delayed_todoist_webhook_does_not_overwrite_newer_notion_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sync = service(mode="todoist-primary", directory=directory)
+            notion = {
+                "page_id": "p-1",
+                "todoist_id": "t-1",
+                "title": "Newer Notion edit",
+                "status": "Backlog",
+                "last_edited_time": "2026-06-15T12:00:00Z",
+            }
+            todo = {
+                "id": "t-1",
+                "content": "Older Todoist edit",
+                "project_id": "inbox",
+                "updated_at": "2026-06-15T11:00:00Z",
+            }
+            sync._find_notion_by_todoist_id = Mock(return_value=notion)
+            sync._list_notion_projects = Mock(return_value={})
+            sync._list_notion_streams = Mock(return_value={})
+            sync.todoist.list_projects.return_value = [{"id": "inbox", "name": "Inbox", "is_inbox_project": True}]
+            sync.todoist.list_sections.return_value = []
+            sync.todoist.get_task.return_value = todo
+            sync._load_state = Mock(
+                return_value={
+                    "__meta__": {"primary_sync_contract_version": 2},
+                    "p-1": {"notion": "old-n", "todoist": "old-t", "todoist_id": "t-1"},
+                }
+            )
+            sync._update_todoist_from_notion_primary = Mock()
+            sync._persist_sync_state_to_notion = Mock()
+            sync._save_state = Mock()
+            sync.handle_todoist_event({"event_name": "item:updated", "event_data": {"id": "t-1"}})
+        sync._update_todoist_from_notion_primary.assert_called_once()
+
+    def test_todoist_primary_periodic_sync_creates_missing_todoist_task_in_project(self):
+        sync = service(mode="todoist-primary")
+        notion = {
+            "page_id": "p-1",
+            "title": "From Luba",
+            "description": "",
+            "status": "Backlog",
+            "todoist_id": "",
+            "todoist_project_id": "tp-1",
+            "todoist_section_id": "",
+            "managed_labels": [],
+        }
+        sync.todoist.create_task.return_value = "t-new"
+        sync._set_notion_todoist_id = Mock()
+        result = SyncResult(errors=[], mode="todoist-primary")
+        sync._sync_todoist_primary(
+            [notion],
+            [],
+            {},
+            result,
+            {},
+            {},
+            [{"id": "tp-1", "name": "Project"}],
+            [],
+        )
+        sync.todoist.create_task.assert_called_once_with(notion)
+        sync._set_notion_todoist_id.assert_called_once_with("p-1", "t-new", "Synced")
+        self.assertEqual(result.notion_to_todoist, 1)
+
+    def test_primary_contract_bootstrap_forces_todoist_to_notion(self):
+        sync = service(mode="todoist-primary")
+        notion = {
+            "page_id": "p-1",
+            "title": "Newer Notion title",
+            "status": "Backlog",
+            "todoist_id": "t-1",
+        }
+        todo = {"id": "t-1", "content": "Current Todoist title", "project_id": "inbox"}
+        state = {"p-1": {"notion": "old-n", "todoist": "old-t", "todoist_id": "t-1"}}
+        result = SyncResult(errors=[], mode="todoist-primary")
+        sync._write_todoist_snapshot_to_notion = Mock()
+        sync._persist_sync_state_to_notion = Mock()
+        sync._sync_todoist_primary(
+            [notion],
+            [todo],
+            state,
+            result,
+            {},
+            {},
+            [{"id": "inbox", "name": "Inbox", "is_inbox_project": True}],
+            [],
+            bootstrap=True,
+        )
+        sync._write_todoist_snapshot_to_notion.assert_called_once()
+        sync.todoist.update_task.assert_not_called()
+        self.assertEqual(result.todoist_to_notion, 1)
+
+    def test_notion_done_requests_todoist_completion_review(self):
+        sync = service(mode="todoist-primary")
+        notion = {
+            "page_id": "p-1",
+            "todoist_id": "t-1",
+            "title": "Task",
+            "description": "",
+            "status": "Done",
+            "priority": "P4",
+            "due_date": None,
+            "deadline": None,
+            "project_name": "",
+            "stream_name": "",
+            "section_name": "",
+            "todoist_section_id": "",
+            "managed_labels": [],
+            "last_edited_time": "2026-06-15T12:00:00Z",
+        }
+        todo = {
+            "id": "t-1",
+            "content": "Task",
+            "description": "",
+            "priority": 1,
+            "labels": [],
+            "project_id": "inbox",
+            "is_completed": False,
+            "updated_at": "2026-06-15T11:00:00Z",
+        }
+        state = {
+            "p-1": {
+                "notion": "older-notion",
+                "todoist": _fingerprint(todo),
+                "todoist_id": "t-1",
+            }
+        }
+        result = SyncResult(errors=[], mode="todoist-primary")
+        sync._update_todoist_from_notion_primary = Mock()
+        sync._request_completion_review = Mock()
+        sync._reconcile_primary_linked_task(notion, todo, state, result, {}, {}, [], [])
+        sync._update_todoist_from_notion_primary.assert_called_once()
+        sync._request_completion_review.assert_called_once_with(notion, todo)
+        sync.todoist.close_task.assert_not_called()
+
+    def test_newer_todoist_change_cancels_stale_notion_completion_request(self):
+        sync = service(mode="todoist-primary")
+        notion = {
+            "page_id": "p-1",
+            "todoist_id": "t-1",
+            "title": "Task",
+            "status": "Done",
+            "last_edited_time": "2026-06-15T11:00:00Z",
+        }
+        todo = {
+            "id": "t-1",
+            "content": "Task updated later",
+            "project_id": "inbox",
+            "is_completed": False,
+            "updated_at": "2026-06-15T12:00:00Z",
+        }
+        state = {"p-1": {"notion": "old-n", "todoist": "old-t", "todoist_id": "t-1"}}
+        result = SyncResult(errors=[], mode="todoist-primary")
+        sync._write_todoist_snapshot_to_notion = Mock()
+        sync._request_completion_review = Mock()
+        sync._reconcile_primary_linked_task(notion, todo, state, result, {}, {}, [], [])
+        sync._write_todoist_snapshot_to_notion.assert_called_once()
+        sync._request_completion_review.assert_not_called()
+
+    def test_completion_review_status_is_not_cleared_on_unchanged_sync(self):
+        sync = service(mode="todoist-primary")
+        notion = {
+            "page_id": "p-1",
+            "todoist_id": "t-1",
+            "title": "Task",
+            "status": "Waiting",
+            "sync_status": "Review required",
+            "sync_error": "Review it",
+        }
+        todo = {"id": "t-1", "content": "Task", "is_completed": False}
+        state = {"p-1": {"notion": _fingerprint(notion), "todoist": _fingerprint(todo), "todoist_id": "t-1"}}
+        result = SyncResult(errors=[], mode="todoist-primary")
+        sync._mark_notion_sync = Mock()
+        sync._reconcile_primary_linked_task(notion, todo, state, result, {}, {}, [], [])
+        sync._mark_notion_sync.assert_not_called()
+
+    def test_newer_todoist_change_wins_conflict(self):
+        sync = service(mode="todoist-primary")
+        notion = {
+            "page_id": "p-1",
+            "todoist_id": "t-1",
+            "title": "Notion edit",
+            "description": "",
+            "status": "Backlog",
+            "priority": "P4",
+            "due_date": None,
+            "deadline": None,
+            "project_name": "",
+            "stream_name": "",
+            "section_name": "",
+            "todoist_section_id": "",
+            "managed_labels": [],
+            "last_edited_time": "2026-06-15T11:00:00Z",
+        }
+        todo = {
+            "id": "t-1",
+            "content": "Newer Todoist edit",
+            "description": "",
+            "priority": 1,
+            "labels": [],
+            "project_id": "inbox",
+            "is_completed": False,
+            "updated_at": "2026-06-15T12:00:00Z",
+        }
+        state = {"p-1": {"notion": "old-n", "todoist": "old-t", "todoist_id": "t-1"}}
+        result = SyncResult(errors=[], mode="todoist-primary")
+        sync._write_todoist_snapshot_to_notion = Mock()
+        sync._reconcile_primary_linked_task(notion, todo, state, result, {}, {}, [], [])
+        sync._write_todoist_snapshot_to_notion.assert_called_once()
+        sync.todoist.update_task.assert_not_called()
 
     def test_runtime_mode_override_persists(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -379,6 +593,17 @@ class SafetyTest(unittest.TestCase):
 
 
 class TodoistClientTest(unittest.TestCase):
+    def test_update_task_can_clear_due_date_and_deadline(self):
+        client = TodoistClient("token", True)
+        with patch("conductor.todoist_client.request_json") as request:
+            client.update_task(
+                "task-1",
+                {"title": "Task", "priority": "P4", "due_date": None, "deadline": None},
+            )
+        payload = request.call_args.kwargs["payload"]
+        self.assertIsNone(payload["due_date"])
+        self.assertIsNone(payload["deadline_date"])
+
     def test_batch_location_update_only_sends_move_commands(self):
         client = TodoistClient("token", True)
         with patch("conductor.todoist_client.request_json") as request:
