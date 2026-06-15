@@ -175,11 +175,17 @@ class TaskSyncService:
                 sections,
                 active_tasks,
             )
-            if self.mode in {"observe", "todoist-primary"}:
+            if self.mode == "observe":
                 return result.as_dict()
 
-            self._ensure_todoist_project_hierarchy(projects, streams, todoist_projects, result)
-            if self.mode == "projects":
+            self._ensure_todoist_project_hierarchy(
+                projects,
+                streams,
+                todoist_projects,
+                result,
+                force=self.mode == "todoist-primary",
+            )
+            if self.mode in {"projects", "todoist-primary"}:
                 return result.as_dict()
             todoist_projects = self.todoist.list_projects()
             self._attach_notion_routing(notion_tasks, projects, streams, todoist_projects, sections)
@@ -811,8 +817,10 @@ class TaskSyncService:
         streams: dict[str, dict[str, str]],
         todoist_projects: list[dict[str, Any]],
         result: SyncResult,
+        *,
+        force: bool = False,
     ) -> None:
-        if not self.allow_project_create:
+        if not force and not self.allow_project_create:
             return
         todoist_by_id = {str(project.get("id")): project for project in todoist_projects}
         todoist_by_name_parent = {
@@ -823,26 +831,31 @@ class TaskSyncService:
         for project in projects.values():
             if project.get("todoist_project_id"):
                 continue
-            stream = stream_by_id.get(str(project.get("stream_id") or ""))
-            parent_id = str((stream or {}).get("todoist_project_id") or "")
-            if stream and not parent_id:
-                existing_parent = todoist_by_name_parent.get((_normalize_title(stream["name"]), ""))
-                parent_id = str(existing_parent.get("id")) if existing_parent else str(
-                    self.todoist.create_project(stream["name"]) or ""
+            try:
+                stream = stream_by_id.get(str(project.get("stream_id") or ""))
+                parent_id = str((stream or {}).get("todoist_project_id") or "")
+                if stream and not parent_id:
+                    existing_parent = todoist_by_name_parent.get((_normalize_title(stream["name"]), ""))
+                    parent_id = str(existing_parent.get("id")) if existing_parent else str(
+                        self.todoist.create_project(stream["name"]) or ""
+                    )
+                    if parent_id:
+                        stream["todoist_project_id"] = parent_id
+                        self._set_notion_external_id(stream["id"], "Todoist Parent Project ID", parent_id)
+                        if parent_id not in todoist_by_id:
+                            result.sections_created += 1
+                existing = todoist_by_name_parent.get((_normalize_title(project["name"]), parent_id))
+                todoist_project_id = str(existing.get("id")) if existing else str(
+                    self.todoist.create_project(project["name"], parent_id or None) or ""
                 )
-                if parent_id:
-                    stream["todoist_project_id"] = parent_id
-                    self._set_notion_external_id(stream["id"], "Todoist Parent Project ID", parent_id)
-                    if parent_id not in todoist_by_id:
-                        result.sections_created += 1
-            existing = todoist_by_name_parent.get((_normalize_title(project["name"]), parent_id))
-            todoist_project_id = str(existing.get("id")) if existing else str(
-                self.todoist.create_project(project["name"], parent_id or None) or ""
-            )
-            if todoist_project_id:
+                if not todoist_project_id:
+                    raise RuntimeError("Todoist did not return a project ID")
                 project["todoist_project_id"] = todoist_project_id
-                self._set_notion_external_id(project["id"], "Todoist Project ID", todoist_project_id)
+                self._set_notion_project_sync(project["id"], todoist_project_id)
                 result.labels_created += 1
+            except Exception as exc:  # noqa: BLE001 - one bad project must not block the rest.
+                result.errors.append(f"Could not sync project {project['name']}: {exc}")
+                self._mark_notion_project_error(project["id"], str(exc))
 
     def _set_notion_external_id(self, page_id: str, property_name: str, value: str) -> None:
         request_json(
@@ -850,6 +863,36 @@ class TaskSyncService:
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=self.notion_headers,
             payload={"properties": {property_name: _rich_text(value)}},
+        )
+
+    def _set_notion_project_sync(self, page_id: str, todoist_project_id: str) -> None:
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=self.notion_headers,
+            payload={
+                "properties": {
+                    "Todoist Project ID": _rich_text(todoist_project_id),
+                    "Todoist Sync status": _select("Synced"),
+                    "Todoist Sync error": _rich_text(""),
+                    "Todoist Last synced": _date(datetime.now(timezone.utc).isoformat()),
+                    "Синхронизировать с Todoist": {"checkbox": True},
+                }
+            },
+        )
+
+    def _mark_notion_project_error(self, page_id: str, error: str) -> None:
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=self.notion_headers,
+            payload={
+                "properties": {
+                    "Todoist Sync status": _select("Error"),
+                    "Todoist Sync error": _rich_text(error),
+                    "Todoist Last synced": _date(datetime.now(timezone.utc).isoformat()),
+                }
+            },
         )
 
     @staticmethod

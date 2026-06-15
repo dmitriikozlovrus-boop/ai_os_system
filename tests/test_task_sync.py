@@ -316,6 +316,7 @@ class SafetyTest(unittest.TestCase):
         todoist.api_token = "token"
         sync = service(todoist, mode="write", allow_project_create=True)
         sync._set_notion_external_id = Mock()
+        sync._set_notion_project_sync = Mock()
         todoist.create_project.side_effect = ["stream-todo", "project-todo"]
         projects = {
             "a": {
@@ -339,7 +340,7 @@ class SafetyTest(unittest.TestCase):
 
     def test_project_without_sync_checkbox_is_created_when_project_writes_are_enabled(self):
         sync = service(mode="projects", allow_project_create=True)
-        sync._set_notion_external_id = Mock()
+        sync._set_notion_project_sync = Mock()
         sync.todoist.create_project.return_value = "todo-project"
         sync._ensure_todoist_project_hierarchy(
             {"a": {"id": "p", "name": "A", "stream_id": "", "todoist_project_id": "", "sync_enabled": False}},
@@ -348,6 +349,30 @@ class SafetyTest(unittest.TestCase):
             SyncResult(errors=[]),
         )
         sync.todoist.create_project.assert_called_once_with("A", None)
+
+    def test_todoist_primary_creates_new_project_and_fills_notion_sync_fields(self):
+        sync = service(mode="todoist-primary")
+        sync._set_notion_project_sync = Mock()
+        sync.todoist.create_project.return_value = "todo-project"
+        sync._ensure_todoist_project_hierarchy(
+            {"a": {"id": "p", "name": "A", "stream_id": "", "todoist_project_id": ""}},
+            {},
+            [],
+            SyncResult(errors=[]),
+            force=True,
+        )
+        sync.todoist.create_project.assert_called_once_with("A", None)
+        sync._set_notion_project_sync.assert_called_once_with("p", "todo-project")
+
+    def test_project_sync_fields_include_id_status_timestamp_and_checkbox(self):
+        sync = service(mode="todoist-primary")
+        with patch("conductor.task_sync.request_json") as request:
+            sync._set_notion_project_sync("page-1", "todo-project")
+        properties = request.call_args.kwargs["payload"]["properties"]
+        self.assertIn("Todoist Project ID", properties)
+        self.assertEqual(properties["Todoist Sync status"], {"select": {"name": "Synced"}})
+        self.assertIn("Todoist Last synced", properties)
+        self.assertEqual(properties["Синхронизировать с Todoist"], {"checkbox": True})
 
     def test_rate_limit_retry_after_is_honored(self):
         self.assertEqual(_retry_after(HttpError(429, '{"error_extra":{"retry_after":1280}}')), 1280)
