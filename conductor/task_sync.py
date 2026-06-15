@@ -95,6 +95,7 @@ class TaskSyncService:
         self.allow_missing_cancel = allow_missing_cancel
         self.max_task_moves = max(max_task_moves, 0)
         self.snapshot_path = Path(snapshot_path)
+        self.report_path = self.snapshot_path.with_name(f"{self.snapshot_path.stem}_report.json")
         self._task_moves = 0
         self._lock = threading.Lock()
 
@@ -162,6 +163,15 @@ class TaskSyncService:
                     active_tasks,
                     result.planned,
                 )
+            )
+            self._save_inventory_report(
+                result.inventory,
+                result.planned,
+                projects,
+                streams,
+                todoist_projects,
+                sections,
+                active_tasks,
             )
             if self.mode == "observe":
                 return result.as_dict()
@@ -670,6 +680,91 @@ class TaskSyncService:
         self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         return self.snapshot_path
+
+    def _save_inventory_report(
+        self,
+        inventory: dict[str, int],
+        planned: dict[str, int],
+        projects: dict[str, dict[str, str]],
+        streams: dict[str, dict[str, str]],
+        todoist_projects: list[dict[str, Any]],
+        sections: list[dict[str, Any]],
+        active_tasks: list[dict[str, Any]],
+    ) -> Path:
+        task_counts: dict[str, int] = {}
+        section_counts: dict[str, int] = {}
+        for task in active_tasks:
+            project_id = str(task.get("project_id") or "")
+            task_counts[project_id] = task_counts.get(project_id, 0) + 1
+        for section in sections:
+            project_id = str(section.get("project_id") or "")
+            section_counts[project_id] = section_counts.get(project_id, 0) + 1
+
+        todoist_by_normalized_name: dict[str, list[dict[str, Any]]] = {}
+        for todoist_project in todoist_projects:
+            todoist_by_normalized_name.setdefault(
+                _normalize_title(todoist_project.get("name")),
+                [],
+            ).append(todoist_project)
+
+        def candidates(name: str, *, root_only: bool = False) -> list[dict[str, str]]:
+            matches = todoist_by_normalized_name.get(_normalize_title(name), [])
+            if root_only:
+                matches = [match for match in matches if not match.get("parent_id")]
+            return [
+                {
+                    "id": str(match.get("id") or ""),
+                    "name": str(match.get("name") or ""),
+                    "parent_id": str(match.get("parent_id") or ""),
+                }
+                for match in matches
+            ]
+
+        report = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "mode": self.mode,
+            "inventory": inventory,
+            "planned": planned,
+            "notion_projects": [
+                {
+                    "notion_id": project.get("id", ""),
+                    "name": project.get("name", ""),
+                    "stream_id": project.get("stream_id", ""),
+                    "todoist_project_id": project.get("todoist_project_id", ""),
+                    "sync_enabled": bool(project.get("sync_enabled")),
+                    "exact_todoist_candidates": candidates(project.get("name", "")),
+                }
+                for project in projects.values()
+            ],
+            "notion_streams": [
+                {
+                    "notion_id": stream.get("id", ""),
+                    "name": stream.get("name", ""),
+                    "todoist_project_id": stream.get("todoist_project_id", ""),
+                    "exact_todoist_candidates": candidates(stream.get("name", ""), root_only=True),
+                }
+                for stream in streams.values()
+            ],
+            "todoist_projects": [
+                {
+                    "id": str(project.get("id") or ""),
+                    "name": str(project.get("name") or ""),
+                    "parent_id": str(project.get("parent_id") or ""),
+                    "active_task_count": task_counts.get(str(project.get("id") or ""), 0),
+                    "section_count": section_counts.get(str(project.get("id") or ""), 0),
+                }
+                for project in todoist_projects
+            ],
+        }
+        self.report_path.parent.mkdir(parents=True, exist_ok=True)
+        self.report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        return self.report_path
+
+    def read_inventory_report(self) -> dict[str, Any]:
+        if not self.report_path.exists():
+            return {"available": False}
+        report = json.loads(self.report_path.read_text(encoding="utf-8"))
+        return {"available": True, **report}
 
     def _ensure_todoist_project_hierarchy(
         self,

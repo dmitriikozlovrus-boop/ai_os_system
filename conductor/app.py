@@ -31,6 +31,9 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if self.path == "/tasks/sync/report":
+            self._json(200, {"ok": True, **service.task_sync.read_inventory_report()})
+            return
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
