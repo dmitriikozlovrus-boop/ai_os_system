@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from conductor.http import HttpError
 from conductor.task_sync import (
+    PRIMARY_SYNC_CONTRACT_VERSION,
     SyncResult,
     TaskSyncService,
     _fingerprint,
@@ -105,6 +106,19 @@ class TodoistMappingTest(unittest.TestCase):
         )
         self.assertEqual(properties["Проект"], {"relation": [{"id": "notion-b"}]})
         self.assertEqual(properties["Todoist Section ID"]["rich_text"][0]["text"]["content"], "section-2")
+
+    def test_unmapped_todoist_project_does_not_leave_orphan_section_in_notion(self):
+        properties = _notion_routing_from_todoist(
+            {"project_id": "unmapped-project", "section_id": "section-1"},
+            {},
+            {},
+            [{"id": "unmapped-project", "name": "Unmapped"}],
+            [{"id": "section-1", "name": "Old section", "project_id": "unmapped-project"}],
+        )
+        self.assertEqual(properties["Проект"], {"relation": []})
+        self.assertEqual(properties["Stream"], {"relation": []})
+        self.assertEqual(properties["Раздел"], {"rich_text": []})
+        self.assertEqual(properties["Todoist Section ID"], {"rich_text": []})
 
     def test_todoist_fields_include_managed_labels(self):
         properties = _notion_properties_from_todoist(
@@ -225,7 +239,7 @@ class SafetyTest(unittest.TestCase):
             sync.todoist.get_task.return_value = todo
             sync._load_state = Mock(
                 return_value={
-                    "__meta__": {"primary_sync_contract_version": 2},
+                    "__meta__": {"primary_sync_contract_version": PRIMARY_SYNC_CONTRACT_VERSION},
                     "p-1": {"notion": "old-n", "todoist": "old-t", "todoist_id": "t-1"},
                 }
             )

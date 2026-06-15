@@ -29,7 +29,7 @@ MANAGED_TODOIST_LABELS = {
     "проверить_завершение",
 }
 COMPLETION_REVIEW_LABEL = "проверить_завершение"
-PRIMARY_SYNC_CONTRACT_VERSION = 2
+PRIMARY_SYNC_CONTRACT_VERSION = 3
 
 
 @dataclass
@@ -1574,13 +1574,17 @@ def _routing_ids_from_todoist(
     )
     stream_id = str((project or {}).get("stream_id") or "")
     section_id = str(task.get("section_id") or "")
-    section = next(
-        (
-            item
-            for item in sections
-            if str(item.get("id")) == section_id and str(item.get("project_id")) == todoist_project_id
-        ),
-        None,
+    section = (
+        next(
+            (
+                item
+                for item in sections
+                if str(item.get("id")) == section_id and str(item.get("project_id")) == todoist_project_id
+            ),
+            None,
+        )
+        if project
+        else None
     )
     return (
         project["id"] if project else None,
