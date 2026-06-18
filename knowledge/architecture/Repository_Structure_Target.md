@@ -2,7 +2,7 @@
 
 Версия: 1.1  
 Статус: целевая архитектура  
-Целевой путь: `docs/architecture/Repository_Structure_Target.md`
+Целевой путь: docs/architecture/Repository_Structure_Target.md
 
 ---
 
