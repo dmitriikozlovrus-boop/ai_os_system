@@ -1,1 +1,3 @@
-TODO: describe this folder.
+# Architecture
+
+Архитектурные принципы, способности системы и стандарты описания.

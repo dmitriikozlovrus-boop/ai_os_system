@@ -1,1 +1,3 @@
-TODO: describe this folder.
+# Development
+
+Стандарты разработки и правила работы с Codex.

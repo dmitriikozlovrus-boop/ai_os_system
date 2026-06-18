@@ -1,1 +1,3 @@
-TODO: describe this folder.
+# Entities
+
+Определения сущностей системы AI OS.

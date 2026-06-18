@@ -1,1 +1,3 @@
-TODO: describe this folder.
+# Vision
+
+Видение, назначение, цели и критерии успеха AI OS.

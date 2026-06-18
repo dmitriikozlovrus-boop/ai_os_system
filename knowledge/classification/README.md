@@ -1,1 +1,3 @@
-TODO: describe this folder.
+# Classification
+
+Правила выбора между похожими сущностями системы.
