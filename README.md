@@ -1,203 +1,85 @@
-# Conductor / Дирижер MVP
+# AI OS System
 
-Сервис для Telegram-бота "Люба" и двусторонней синхронизации задач Notion ↔ Todoist.
-Todoist используется как основной рабочий интерфейс, а Notion — как общая база задач для Любы и будущих агентов.
+## Что это
 
-## Что уже поддержано
+AI OS System — персональная ИИ-инфраструктура.
 
-- Telegram webhook: `POST /telegram/webhook`
-- Проверка здоровья: `GET /healthz`
-- Текстовые сообщения
-- Голосовые/аудио сообщения через Telegram file API + OpenAI transcription
-- AI-классификация на задачи и вопросы на изучение
-- Уточнения в Telegram, если не хватает проекта, срока или уверенность ниже порога
-- Создание задач в Notion `Tasks`
-- Создание записей в Notion `Study / На изучение`
-- Локальное хранение ожидающих уточнений в `data/pending.json`
-- Полная двусторонняя синхронизация базы `TASKS` и Todoist
+Система предназначена для приема входящей информации, классификации сущностей, работы с задачами, событиями, исследованиями, идеями, проблемами, документами и будущими агентами.
 
-## Быстрый старт
+Репозиторий содержит код текущего MVP, устойчивые знания системы и проектную документацию.
 
-1. Создай `.env` из примера:
+## Текущий рабочий MVP
 
-```bash
-cp .env.example .env
-```
+Текущий рабочий MVP — `Conductor / Дирижёр`.
 
-2. Заполни токены:
+`Conductor` принимает входящую информацию, классифицирует ее, создает и обновляет записи, синхронизирует задачи и возвращает результат обработки.
 
-- `TELEGRAM_BOT_TOKEN`
-- `OPENAI_API_KEY`
-- `NOTION_TOKEN`
-
-3. Запусти локально:
-
-```bash
-python3 -m conductor.app
-```
-
-4. Для локального теста без Telegram:
-
-```bash
-python3 -m conductor.cli "Завтра напомни написать Марко по алюминию. И изучить доступные логистические пути в Веракрус"
-```
-
-## Notion базы
-
-Текущие ID уже проставлены в `.env.example`:
-
-- `Tasks`: `be9d26fe652b474696cd5de0118b1210`
-- `Study / На изучение`: `4e27e10ca2bf44a08b4c8f86c7a125bd`
-- `Projects / Приоритеты`: `bbb501a6933941b4837afff250479f0e`
-
-## Важная логика MVP
-
-- Если срок не указан, Дирижер спрашивает срок.
-- Если проект не найден или уверенность ниже `CONFIDENCE_THRESHOLD`, Дирижер спрашивает уточнение.
-- Если в сообщении есть и задачи, и вопросы на изучение, создаются обе сущности.
-- Исходный RAW отдельно не сохраняется.
-- Todoist включается при наличии `TODOIST_API_TOKEN`; аварийная пауза управляется
-  только переменной `TODOIST_SYNC_PAUSED`.
-
-## TASKS ↔ Todoist
-
-Новая модель маршрутизации:
-
-- `STREAMS` соответствует родительскому проекту Todoist;
-- `PROJECTS` соответствует дочернему проекту Todoist;
-- расположение задачи в Todoist определяет `TASKS.Проект`;
-- `TASKS.Stream` определяется через связь Project → Stream;
-- раздел Todoist записывается прямо в `TASKS.Раздел` и `TASKS.Todoist Section ID`;
-- разделы создаются и редактируются в Todoist, отдельной базы Sections нет;
-- проектные метки больше не используются для маршрутизации.
-
-Обязательные поля базы Notion: `Task`, `Описание`, `Статус`, `Deadline`, `Срок выполнения`, `Strategic Impact`,
-`Source`, `Проект`, `Stream`, `Раздел`, `Todoist Section ID`, `Метки Todoist`, `Todoist ID`,
-`Sync status`, `Sync error`, `Sync Notion hash`, `Sync Todoist hash`.
-
-Сопоставление полей:
-
-| Notion `TASKS` | Todoist |
-| --- | --- |
-| `Task` | название задачи |
-| `Описание` | описание задачи |
-| `Статус: Done` | задача завершена |
-| `Статус: Cancelled` | задача завершена с сохранением истории |
-| `Срок выполнения` | due date |
-| `Deadline` | deadline |
-| `Strategic Impact` | priority |
-| `Проект` | проект, в котором находится задача |
-| `Stream` | группа проекта; определяется через Project → Stream |
-| `Раздел` | название раздела внутри проекта |
-| `Todoist Section ID` | стабильная связь с разделом |
-| `Метки Todoist` | только разрешённые операционные метки |
-| `Todoist ID` | стабильная связь записей |
-| `Sync status` | техническое состояние синхронизации |
-| `Sync error` | последняя причина ошибки; очищается после успешной сверки |
-| `Sync Notion hash` | технический отпечаток последней синхронизированной версии Notion |
-| `Sync Todoist hash` | технический отпечаток последней синхронизированной версии Todoist |
-
-Разрешённые управляемые метки: `встреча`, `звонок`, `письмо`, `сообщение`, `документ`,
-`анализ`, `исследование`, `планирование`, `низкая_энергия`, `средняя_энергия`,
-`высокая_энергия`, `пятиминутное_дело`. Служебная метка `проверить_завершение`
-показывает задачи, которые Люба, агент или пользователь завершили в Notion и которые
-нужно подтвердить закрытием в Todoist. Все остальные метки сохраняются без изменений.
-
-Рабочий режим `todoist-primary` использует Todoist как первоначальный источник:
-
-- первая сверка новой версии переносит текущие версии связанных задач Todoist в Notion;
-- webhook переносит изменения Todoist почти сразу, включая задачи во входящих;
-- периодическая сверка каждые 5 минут восстанавливает пропущенные события;
-- новые активные задачи из Notion создаются в Todoist: в назначенном проекте или во входящих;
-- последующие конфликты решаются по времени изменения;
-- удаление Todoist переводит запись Notion в `Cancelled`;
-- `Done` или `Cancelled` из Notion не закрывает Todoist без второго ключа: задача остаётся
-  активной с меткой `проверить_завершение`.
-
-Режим `observe` остаётся доступен для инвентаризации без удалённых записей.
-
-Для запуска:
-
-```bash
-TODOIST_SYNC_PAUSED=false
-TODOIST_SYNC_MODE=observe
-TODOIST_API_TOKEN=...
-TODOIST_WEBHOOK_SECRET=...
-TASK_SYNC_SECRET=...
-```
-
-Защитные разрешения для поэтапного canary-запуска:
-
-```bash
-TODOIST_ALLOW_PROJECT_CREATE=false
-TODOIST_ALLOW_TASK_CREATE=false
-TODOIST_ALLOW_TASK_MOVE=false
-TODOIST_ALLOW_LABEL_WRITE=false
-TODOIST_ALLOW_STATUS_WRITE=false
-TODOIST_ALLOW_MISSING_CANCEL=false
-TODOIST_MAX_TASK_MOVES=10
-```
-
-Аварийная пауза без удаления токенов:
-
-```bash
-TODOIST_SYNC_PAUSED=true
-```
-
-Ручной reconciliation:
-
-```bash
-curl -X POST \
-  -H "X-Conductor-Sync-Secret: $TASK_SYNC_SECRET" \
-  https://YOUR_DOMAIN/tasks/sync
-```
-
-Для мгновенного Todoist → Notion обновления зарегистрируй webhook приложения Todoist:
+На текущем этапе код сервиса находится в корневой папке:
 
 ```text
-https://YOUR_DOMAIN/todoist/webhook
+conductor/
 ```
 
-В `TODOIST_WEBHOOK_SECRET` указывается Client Secret приложения Todoist. Без webhook периодический
-reconciliation продолжает синхронизировать активные задачи и завершения. Удаления определяются
-периодической сверкой после успешной загрузки истории завершённых задач. С webhook эти изменения
-попадают в Notion почти сразу.
+Целевая архитектура может предусматривать будущий перенос в:
 
-## Telegram webhook
-
-Для публичного запуска нужен HTTPS URL. После деплоя выстави webhook:
-
-```bash
-curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook?url=https://YOUR_DOMAIN/telegram/webhook"
+```text
+apps/conductor/
 ```
 
-Или через скрипт:
+Такой перенос не выполняется без отдельной миграционной задачи.
 
-```bash
-TELEGRAM_BOT_TOKEN=... PUBLIC_BASE_URL=https://YOUR_DOMAIN sh deploy/set_webhook.sh
+Операционное описание Conductor MVP вынесено в:
+
+```text
+docs/services/conductor/Conductor_MVP_Operations.md
 ```
 
-## Онлайн-запуск
+## Структура
 
-Проект подготовлен для Render через `Dockerfile` и `render.yaml`.
+```text
+conductor/  — текущий рабочий код Conductor MVP
+knowledge/  — устойчивые знания системы
+docs/       — проектная, техническая, сервисная и продуктовая документация
+tests/      — тесты
+deploy/     — деплой
+```
 
-Нужные переменные окружения на хостинге:
+## Где искать
 
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_WEBHOOK_SECRET` — любая длинная случайная строка, опционально, но желательно
-- `OPENAI_API_KEY`
-- `NOTION_TOKEN`
-- `NOTION_TASKS_DATABASE_ID`
-- `NOTION_STUDY_DATABASE_ID`
-- `NOTION_PROJECTS_DATABASE_ID`
-- `TODOIST_API_TOKEN`
-- `TODOIST_WEBHOOK_SECRET`
-- `TASK_SYNC_SECRET`
+| Раздел | Путь |
+|---|---|
+| Видение | `knowledge/vision/` |
+| Сущности | `knowledge/entities/` |
+| Классификация | `knowledge/classification/` |
+| Архитектура репозитория | `docs/architecture/` |
+| Данные | `docs/data/` |
+| Сервисы | `docs/services/` |
+| Use cases | `docs/product/use_cases/` |
+| Агенты и роли | `knowledge/agents/` |
 
-После деплоя надо вызвать Telegram `setWebhook` на публичный URL сервиса.
+## Ключевые документы
 
-## Следующие доработки
+| Документ | Назначение |
+|---|---|
+| `docs/architecture/System_Map.md` | верхнеуровневая логическая карта AI OS |
+| `docs/architecture/System_Component_Registry.md` | перечень компонентов по архитектурным слоям |
+| `docs/architecture/Document_Placement_Rules.md` | правила размещения документов |
+| `knowledge/agents/Agent_Registry.md` | роли агентов и сервисов |
+| `docs/product/use_cases/Use_Case_Template.md` | шаблон описания пользовательских сценариев |
+| `docs/services/conductor/README.md` | краткое описание Conductor service docs |
+| `docs/services/conductor/Conductor_Service_Description.md` | роль, ответственность и границы Conductor |
+| `docs/services/conductor/Conductor_MVP_Operations.md` | запуск, webhook, переменные окружения, Notion, Todoist, OpenAI transcription и эксплуатация MVP |
 
-- Кнопки "Изменить" и пошаговое редактирование параметров.
-- OCR для фото и документов.
-- Поддержка испанского и английского.
+## Правило работы с README
+
+Корневой `README.md` должен оставаться короткой входной дверью в AI OS System.
+
+Подробное операционное описание конкретных сервисов не должно храниться в корневом README.
+
+Если информация относится к запуску, webhook, переменным окружения, Notion, Todoist, OpenAI transcription, командам или эксплуатации Conductor MVP, она должна храниться в:
+
+```text
+docs/services/conductor/Conductor_MVP_Operations.md
+```
+
+Если информация относится к архитектуре, данным, агентам, use cases или roadmap, она должна храниться в соответствующем разделе `docs/` или `knowledge/`.
