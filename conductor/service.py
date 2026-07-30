@@ -6,6 +6,21 @@ import re
 from datetime import date
 from typing import Any
 
+from .backlog_triage import (
+    build_merge_proposal,
+    build_split_proposal,
+    calculate_readiness,
+    choose_semantic_action,
+    clarification_questions,
+    duplicate_pairs,
+    format_duplicate_pairs,
+    format_implementation_candidates,
+    format_triage_preview,
+    implementation_candidates,
+    normalize_with_ai,
+    semantic_match_improvements,
+    triage_backlog,
+)
 from .config import Settings
 from .feedback_backlog import (
     build_feedback_system_issue,
@@ -104,6 +119,18 @@ class ConductorService:
                 return self._handle_feedback_followup(text, chat_id=chat_id, source=source, feedback=feedback)
             if _looks_like_technical_spec_request(text):
                 return self._handle_technical_spec_request(text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
+            if _looks_like_backlog_ai_triage_request(text):
+                return self._handle_backlog_triage_request(text, chat_id=chat_id)
+            if _looks_like_backlog_triage_open_request(text):
+                return self._handle_backlog_triage_open_request(text, chat_id=chat_id)
+            if _looks_like_duplicate_request(text):
+                return self._handle_duplicate_request(text, chat_id=chat_id)
+            if _looks_like_split_request(text):
+                return self._handle_split_request(text, chat_id=chat_id)
+            if _looks_like_implementation_candidates_request(text):
+                return self._handle_implementation_candidates_request(text, chat_id=chat_id)
+            if _looks_like_existing_technical_spec_selection(text):
+                return self._handle_backlog_technical_spec_selection(text, chat_id=chat_id)
             if _feedback_backlog_enabled(getattr(self, "settings", None)) and _looks_like_backlog_browse_request(text):
                 return self._handle_backlog_browse_request(text, chat_id=chat_id)
             if _feedback_backlog_enabled(getattr(self, "settings", None)) and _looks_like_backlog_open_request(text):
@@ -429,6 +456,27 @@ class ConductorService:
             self.interactions.pop_feedback(chat_id)
             merged = f"{feedback.get('command') or ''}\n{text}".strip()
             return self._handle_normalized_feedback(merged, chat_id=chat_id, source=source, reply_to_message_id=None)
+        if state == "awaiting_backlog_clarification_answer":
+            self.interactions.pop_feedback(chat_id)
+            improvement = feedback.get("improvement") or {}
+            normalized = normalize_feedback(text)
+            try:
+                self._update_backlog_summary_for_feedback(improvement, normalized)
+            except Exception as exc:  # noqa: BLE001
+                print(f"FEEDBACK_BACKLOG_ERROR state=clarification_save: {exc}", flush=True)
+                self._send_message(chat_id, f"Не смогла сохранить уточнение: {_safe_error(exc)}")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["backlog clarification failed"]}
+            print(f"BACKLOG_CLARIFICATION_SAVED improvement_id={improvement.get('page_id')}", flush=True)
+            self._send_message(chat_id, "Уточнение сохранено в summary Improvement.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog clarification saved"]}
+        if state == "awaiting_semantic_match_selection":
+            return self._handle_semantic_match_selection(text, chat_id=chat_id, feedback=feedback)
+        if state == "awaiting_backlog_merge_confirmation":
+            self.interactions.pop_feedback(chat_id)
+            if _looks_like_yes(text):
+                return self._confirm_backlog_merge(chat_id, feedback)
+            self._send_message(chat_id, "Хорошо, Improvements не объединяю.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog merge declined"]}
         if state == "awaiting_new_improvement_confirmation":
             self.interactions.pop_feedback(chat_id)
             if _looks_like_improvement_yes(text):
@@ -794,7 +842,12 @@ class ConductorService:
     ) -> dict[str, Any]:
         print("FEEDBACK_NORMALIZATION_STARTED state=start", flush=True)
         interaction = self.interactions.find_by_reply(chat_id, reply_to_message_id) or self.interactions.latest_for_chat(chat_id)
-        feedback = normalize_feedback(text, interaction=interaction)
+        feedback = normalize_with_ai(
+            openai=self.openai,
+            raw_text=text,
+            interaction=interaction,
+            enabled=_backlog_ai_triage_enabled(getattr(self, "settings", None)),
+        )
         print(f"FEEDBACK_NORMALIZED feedback_kind={feedback.feedback_kind} confidence={feedback.confidence:.2f}", flush=True)
         if feedback.feedback_kind == "CORRECTION" and interaction:
             return self._capture_feedback(text, chat_id=chat_id, source=source, interaction=interaction, command=text)
@@ -825,11 +878,26 @@ class ConductorService:
             print(f"FEEDBACK_STORED_AS_SYSTEM_ISSUE system_issue_id={_safe_notion_page_id(issue_url)} feedback_kind={feedback.feedback_kind}", flush=True)
 
         try:
-            candidates = self.notion.list_open_improvements(limit=20)
+            candidates = self.notion.list_open_improvements(limit=10)
         except Exception as exc:  # noqa: BLE001
             print(f"FEEDBACK_BACKLOG_ERROR state=improvement_search: {exc}", flush=True)
             candidates = []
-        match = choose_matching_improvement(candidates, feedback)
+        ai_triage_enabled = _backlog_ai_triage_enabled(getattr(self, "settings", None))
+        matches = (
+            semantic_match_improvements(
+                openai=self.openai,
+                feedback=feedback,
+                shortlist=candidates,
+                enabled=True,
+            )
+            if ai_triage_enabled
+            else []
+        )
+        match_map = {item.page_id: item for item in candidates}
+        action = choose_semantic_action(matches)
+        match = match_map.get(matches[0].improvement_id) if matches and action == "link" else None
+        if not ai_triage_enabled:
+            match = choose_matching_improvement(candidates, feedback)
         recommendation = priority_recommendation(feedback=feedback, signal_count=(len(match.related_issue_urls) + 1 if match else 1), explicit_request=_wants_backlog_create(text))
         if match:
             print(f"FEEDBACK_MATCHED_TO_IMPROVEMENT improvement_id={match.page_id} candidate_count={len(candidates)}", flush=True)
@@ -845,6 +913,22 @@ class ConductorService:
             self.interactions.update_feedback(chat_id, payload)
             self._send_message(chat_id, _format_backlog_existing_offer(match, recommendation))
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback matched improvement"], "issue_url": issue_url}
+        if matches and action == "choose":
+            options = [match_map[item.improvement_id] for item in matches[:3] if item.improvement_id in match_map]
+            self.interactions.update_feedback(
+                chat_id,
+                {
+                    "state": "awaiting_semantic_match_selection",
+                    "system_issue_url": issue_url,
+                    "related_issue_urls": [issue_url] if issue_url else [],
+                    "normalized_feedback": feedback.__dict__,
+                    "matches": [item.__dict__ for item in matches[:3]],
+                    "options": [item.__dict__ for item in options],
+                    "priority_recommendation": recommendation.__dict__,
+                },
+            )
+            self._send_message(chat_id, _format_semantic_match_options(options, matches))
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback match options"], "issue_url": issue_url}
 
         payload = {
             "state": "awaiting_new_improvement_confirmation",
@@ -955,6 +1039,136 @@ class ConductorService:
         index = _backlog_index_from_text(text)
         if backlog_list and index is not None:
             items = backlog_list.get("items") or []
+            if 0 <= index < len(items):
+                return items[index]
+        return None
+
+    def _handle_semantic_match_selection(self, text: str, *, chat_id: int, feedback: dict[str, Any]) -> dict[str, Any]:
+        if _wants_separate_improvement(text):
+            self.interactions.pop_feedback(chat_id)
+            return self._create_backlog_improvement(chat_id, feedback)
+        index = _backlog_index_from_text(text)
+        options = feedback.get("options") or []
+        if index is None or not (0 <= index < len(options)):
+            self.interactions.update_feedback(chat_id, feedback)
+            self._send_message(chat_id, "Выбери номер Improvement или напиши: создай отдельное улучшение.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["semantic match unclear"]}
+        selected = options[index]
+        feedback["existing_improvement"] = selected
+        feedback["state"] = "awaiting_existing_improvement_link_confirmation"
+        self.interactions.update_feedback(chat_id, feedback)
+        self._send_message(chat_id, f"Добавить сигнал к Improvement «{selected.get('title')}»?")
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["semantic match selected"]}
+
+    def _handle_backlog_triage_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        if not _backlog_ai_triage_enabled(getattr(self, "settings", None)):
+            self._send_message(chat_id, _ai_triage_disabled_message())
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog ai triage disabled"]}
+        print("BACKLOG_TRIAGE_REQUESTED state=request", flush=True)
+        try:
+            items = self.notion.list_open_improvements(limit=10)
+        except Exception as exc:  # noqa: BLE001
+            print(f"FEEDBACK_BACKLOG_ERROR state=triage_list: {exc}", flush=True)
+            self._send_message(chat_id, f"Не смогла разобрать backlog: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["backlog triage failed"]}
+        pairs = triage_backlog(items, self.interactions.feedback_signals)
+        self.interactions.remember_triage_list(chat_id, [item.__dict__ for item, _ in pairs])
+        print(f"BACKLOG_TRIAGE_SHOWN candidate_count={len(pairs)}", flush=True)
+        self._send_message(chat_id, format_triage_preview(pairs))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog triage shown"], "count": len(pairs)}
+
+    def _handle_backlog_triage_open_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        item = self._resolve_triage_context(text, chat_id=chat_id)
+        if not item:
+            self._send_message(chat_id, "Сначала запусти разбор backlog.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["triage context missing"]}
+        improvement = ImprovementSummary(**item)
+        readiness = calculate_readiness(improvement, self.interactions.feedback_signals(improvement.page_id))
+        questions = clarification_questions(readiness)
+        self.interactions.update_feedback(chat_id, {"state": "awaiting_backlog_clarification_answer", "improvement": improvement.__dict__, "readiness": readiness.__dict__})
+        print(f"BACKLOG_CLARIFICATION_REQUESTED improvement_id={improvement.page_id}", flush=True)
+        self._send_message(chat_id, "Для уточнения Improvement нужны ответы:\n\n" + "\n".join(f"{i}. {q}" for i, q in enumerate(questions, 1)))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog clarification requested"]}
+
+    def _handle_duplicate_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        if not _backlog_ai_triage_enabled(getattr(self, "settings", None)):
+            self._send_message(chat_id, _ai_triage_disabled_message())
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog ai triage disabled"]}
+        items = self.notion.list_open_improvements(limit=20)
+        pairs = duplicate_pairs(items)
+        if pairs:
+            proposal = build_merge_proposal(pairs[0][0], pairs[0][1])
+            self.interactions.update_feedback(chat_id, {"state": "awaiting_backlog_merge_confirmation", "proposal": proposal.__dict__, "primary": pairs[0][0].__dict__, "secondary": pairs[0][1].__dict__})
+            print(f"BACKLOG_MERGE_PROPOSED improvement_id={proposal.primary_improvement_id}", flush=True)
+        self._send_message(chat_id, format_duplicate_pairs(pairs))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog duplicates shown"]}
+
+    def _handle_split_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        item = self._resolve_triage_context(text, chat_id=chat_id) or self._resolve_backlog_context(text, chat_id=chat_id)
+        if not item:
+            self._send_message(chat_id, "Не удалось определить Improvement для split proposal.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["split context missing"]}
+        improvement = ImprovementSummary(**item)
+        proposal = build_split_proposal(improvement, self.interactions.feedback_signals(improvement.page_id))
+        if not proposal:
+            self._send_message(chat_id, "Явных разных проблем для разделения не найдено.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["split proposal empty"]}
+        print(f"BACKLOG_SPLIT_PROPOSED improvement_id={improvement.page_id}", flush=True)
+        self._send_message(chat_id, _format_split_proposal(proposal))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["split proposal shown"]}
+
+    def _confirm_backlog_merge(self, chat_id: int, feedback: dict[str, Any]) -> dict[str, Any]:
+        proposal = feedback.get("proposal") or {}
+        primary = feedback.get("primary") or {}
+        secondary = feedback.get("secondary") or {}
+        try:
+            self.notion.add_issues_to_improvement(str(primary.get("page_id") or primary.get("url") or ""), related_issue_urls=proposal.get("relation_ids_to_keep", []))
+            for signal in self.interactions.feedback_signals(str(secondary.get("page_id") or "")):
+                self.interactions.remember_feedback_signal(str(primary.get("page_id") or ""), signal)
+            self._update_backlog_summary_for_feedback(primary, normalize_feedback(f"Объединено с: {secondary.get('url') or secondary.get('title') or ''}"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"FEEDBACK_BACKLOG_ERROR state=merge_primary: {exc}", flush=True)
+            self._send_message(chat_id, f"Не смогла выполнить merge: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["backlog merge failed"]}
+        try:
+            self.notion.update_improvement_status(str(secondary.get("page_id") or secondary.get("url") or ""), "Отложено")
+        except Exception as exc:  # noqa: BLE001
+            print(f"BACKLOG_MERGE_PARTIAL_FAILURE improvement_id={primary.get('page_id')}: {exc}", flush=True)
+            self._send_message(chat_id, "Основной Improvement обновлен, но второй не удалось отложить.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["backlog merge partial"]}
+        print(f"BACKLOG_MERGE_CONFIRMED improvement_id={primary.get('page_id')}", flush=True)
+        self._send_message(chat_id, "Merge выполнен: relations и signals объединены, второй Improvement отложен.")
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog merge confirmed"]}
+
+    def _handle_implementation_candidates_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        if not _backlog_ai_triage_enabled(getattr(self, "settings", None)):
+            self._send_message(chat_id, _ai_triage_disabled_message())
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog ai triage disabled"]}
+        items = self.notion.list_open_improvements(limit=10)
+        pairs = triage_backlog(items, self.interactions.feedback_signals)
+        candidates = implementation_candidates(pairs)
+        self.interactions.remember_triage_list(chat_id, [item.__dict__ for item, _ in candidates])
+        print(f"BACKLOG_IMPLEMENTATION_CANDIDATES_SHOWN candidate_count={len(candidates)}", flush=True)
+        self._send_message(chat_id, format_implementation_candidates(candidates))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["implementation candidates shown"]}
+
+    def _handle_backlog_technical_spec_selection(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        item = self._resolve_triage_context(text, chat_id=chat_id) or self._resolve_backlog_context(text, chat_id=chat_id)
+        if not item:
+            self._send_message(chat_id, "Не удалось определить Improvement для ТЗ.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec context missing"]}
+        improvement = ImprovementSummary(**item)
+        readiness = calculate_readiness(improvement, self.interactions.feedback_signals(improvement.page_id))
+        if readiness.score < 60:
+            self._send_message(chat_id, "Пока рано готовить ТЗ.\nНе хватает:\n" + "\n".join(f"- {item}" for item in readiness.missing_information))
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec readiness insufficient"]}
+        return self._handle_technical_spec_request(f"Сформируй ТЗ {improvement.url}", chat_id=chat_id, reply_to_message_id=None)
+
+    def _resolve_triage_context(self, text: str, *, chat_id: int) -> dict[str, Any] | None:
+        triage = self.interactions.get_triage_list(chat_id)
+        index = _backlog_index_from_text(text)
+        if triage and index is not None:
+            items = triage.get("items") or []
             if 0 <= index < len(items):
                 return items[index]
         return None
@@ -1211,6 +1425,61 @@ def _looks_like_backlog_management_request(text: str) -> bool:
     )
 
 
+def _looks_like_backlog_ai_triage_request(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(
+        marker in normalized
+        for marker in (
+            "разбери backlog",
+            "что требует моего внимания",
+            "покажи необработанные улучшения",
+            "что готово к доработке",
+            "какие записи похожи",
+        )
+    )
+
+
+def _looks_like_backlog_triage_open_request(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(marker in normalized for marker in ("разбери первое", "разбери второе", "что неясно", "подготовь вопросы по улучшению"))
+
+
+def _looks_like_duplicate_request(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(marker in normalized for marker in ("покажи возможные дубли", "какие улучшения можно объединить"))
+
+
+def _looks_like_split_request(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(marker in normalized for marker in ("раздели улучшение", "предложи разделение", "split"))
+
+
+def _looks_like_implementation_candidates_request(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(marker in normalized for marker in ("что лучше доработать следующим", "выбери кандидатов на доработку", "покажи самые важные готовые улучшения"))
+
+
+def _looks_like_existing_technical_spec_selection(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(marker in normalized for marker in ("выбираю первое", "выбираю второе", "подготовь тз по этому improvement", "начинаем доработку"))
+
+
+def _backlog_ai_triage_enabled(settings: Any) -> bool:
+    return getattr(settings, "backlog_ai_triage_enabled", False) is True
+
+
+def _ai_triage_disabled_message() -> str:
+    return (
+        "Расширенный AI-разбор backlog сейчас недоступен.\n\n"
+        "Базовый список, фильтры и рекомендации приоритета продолжают работать."
+    )
+
+
+def _wants_separate_improvement(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(marker in normalized for marker in ("создай отдельное", "отдельное улучшение", "создай новый"))
+
+
 def _looks_like_show_full_spec(text: str) -> bool:
     return text.strip().casefold() in {"да", "покажи", "покажи полностью", "yes", "y"}
 
@@ -1418,6 +1687,27 @@ def _format_backlog_existing_offer(improvement: ImprovementSummary, recommendati
         f"Рекомендуемый приоритет: {recommendation.recommended_priority}\n"
         f"Score: {recommendation.score}\n"
         f"Причины:\n{reasons}"
+    )
+
+
+def _format_semantic_match_options(options: list[ImprovementSummary], matches: list[Any]) -> str:
+    lines = ["Возможные связанные улучшения:"]
+    for index, option in enumerate(options[:3], start=1):
+        match = next((item for item in matches if item.improvement_id == option.page_id), None)
+        score = match.score if match else 0
+        reasons = "; ".join((match.reasons if match else [])[:2]) or "похоже по смыслу"
+        lines.extend(["", f"{index}. {option.title}", f"Score: {score}", f"Почему: {reasons}"])
+    lines.append("\nВыбери номер или напиши: создай отдельное улучшение.")
+    return "\n".join(lines)
+
+
+def _format_split_proposal(proposal: Any) -> str:
+    titles = "\n".join(f"{index}. {title}" for index, title in enumerate(proposal.suggested_titles, start=1))
+    return (
+        "Текущий Improvement может объединять разные проблемы:\n\n"
+        f"{titles}\n\n"
+        "Предлагается оставить первую проблему здесь и создать отдельный Improvement для второй.\n"
+        "Без отдельного подтверждения ничего не меняю."
     )
 
 

@@ -17,6 +17,16 @@ def normalize_feedback(text: str, *, interaction: dict[str, Any] | None = None) 
     is_reply_context = bool(context)
     if not normalized:
         return _feedback("NOT_FEEDBACK", original, "Пустая обратная связь", confidence=0.0)
+    if _is_neutral_reply(normalized):
+        return _feedback(
+            "NOT_FEEDBACK",
+            original,
+            "Нейтральный ответ пользователя",
+            normalized_description="Пользователь подтвердил или поблагодарил. Это не системная ошибка.",
+            should_create_system_issue=False,
+            should_find_or_create_improvement=False,
+            confidence=0.95,
+        )
     if _is_correction(normalized):
         return _feedback(
             "CORRECTION",
@@ -55,7 +65,7 @@ def normalize_feedback(text: str, *, interaction: dict[str, Any] | None = None) 
             proposed_improvement_description=f"Добавить в backlog идею пользователя: {title}.",
             confidence=0.72,
         )
-    if _is_concrete_error(normalized) or is_reply_context:
+    if _is_concrete_error(normalized):
         title = _problem_title(normalized, recurring=False)
         return _feedback(
             "CONCRETE_ERROR",
@@ -288,6 +298,10 @@ def _feedback(kind: str, original: str, title: str, **kwargs: Any) -> Normalized
 
 def _is_correction(text: str) -> bool:
     return any(text.startswith(prefix) for prefix in ("нет, это ", "поставь ", "это для проекта ", "исправь"))
+
+
+def _is_neutral_reply(text: str) -> bool:
+    return text in {"спасибо", "все правильно", "всё правильно", "отлично", "да", "понял", "поняла", "хорошо", "именно так", "ок", "окей"}
 
 
 def _is_idea(text: str) -> bool:

@@ -266,9 +266,67 @@ class NormalizedFeedback:
 
 
 @dataclass
+class FeedbackEnrichment:
+    feedback_kind: str
+    normalized_title: str
+    normalized_description: str
+    actual_behavior: str
+    expected_behavior: str
+    affected_entity_type: str
+    affected_database: str
+    affected_component: str
+    severity: str
+    is_recurring_statement: bool
+    should_create_system_issue: bool
+    should_find_or_create_improvement: bool
+    proposed_improvement_title: str
+    proposed_improvement_description: str
+    confidence: float
+    inferred_fields: list[str]
+    evidence: list[str]
+    needs_clarification: bool
+    clarification_question: str
+
+
+@dataclass
 class BacklogPriorityRecommendation:
     recommended_priority: str
     score: int
+    reasons: list[str]
+
+
+@dataclass
+class ImprovementMatchCandidate:
+    improvement_id: str
+    score: int
+    relation_type: str
+    reasons: list[str]
+    contradictions: list[str]
+
+
+@dataclass
+class BacklogReadiness:
+    status: str
+    score: int
+    reasons: list[str]
+    missing_information: list[str]
+
+
+@dataclass
+class BacklogMergeProposal:
+    primary_improvement_id: str
+    secondary_improvement_id: str
+    primary_title: str
+    secondary_title: str
+    relation_ids_to_keep: list[str]
+    reasons: list[str]
+
+
+@dataclass
+class BacklogSplitProposal:
+    improvement_id: str
+    current_title: str
+    suggested_titles: list[str]
     reasons: list[str]
 
 
@@ -441,4 +499,38 @@ def technical_change_proposal_from_dict(data: dict[str, Any]) -> TechnicalChange
         risks=[str(value) for value in data.get("risks", []) if str(value).strip()],
         open_questions=[str(value) for value in data.get("open_questions", []) if str(value).strip()],
         confidence=max(0.0, min(_as_float(data.get("confidence"), 0.0), 1.0)),
+    )
+
+
+def feedback_enrichment_from_dict(data: dict[str, Any]) -> FeedbackEnrichment:
+    return FeedbackEnrichment(
+        feedback_kind=str(data.get("feedback_kind") or "UNKNOWN").strip(),
+        normalized_title=str(data.get("normalized_title") or "").strip(),
+        normalized_description=str(data.get("normalized_description") or "").strip(),
+        actual_behavior=str(data.get("actual_behavior") or "").strip(),
+        expected_behavior=str(data.get("expected_behavior") or "").strip(),
+        affected_entity_type=str(data.get("affected_entity_type") or "Unknown").strip(),
+        affected_database=str(data.get("affected_database") or "Другое").strip(),
+        affected_component=str(data.get("affected_component") or "Другое").strip(),
+        severity=str(data.get("severity") or "Средняя").strip(),
+        is_recurring_statement=bool(data.get("is_recurring_statement", False)),
+        should_create_system_issue=bool(data.get("should_create_system_issue", False)),
+        should_find_or_create_improvement=bool(data.get("should_find_or_create_improvement", False)),
+        proposed_improvement_title=str(data.get("proposed_improvement_title") or "").strip(),
+        proposed_improvement_description=str(data.get("proposed_improvement_description") or "").strip(),
+        confidence=max(0.0, min(_as_float(data.get("confidence"), 0.0), 1.0)),
+        inferred_fields=[str(value) for value in data.get("inferred_fields", []) if str(value).strip()],
+        evidence=[str(value) for value in data.get("evidence", []) if str(value).strip()],
+        needs_clarification=bool(data.get("needs_clarification", False)),
+        clarification_question=str(data.get("clarification_question") or "").strip(),
+    )
+
+
+def improvement_match_candidate_from_dict(data: dict[str, Any]) -> ImprovementMatchCandidate:
+    return ImprovementMatchCandidate(
+        improvement_id=str(data.get("improvement_id") or "").strip(),
+        score=max(0, min(_as_int(data.get("score")) or 0, 100)),
+        relation_type=str(data.get("relation_type") or "NOT_RELATED").strip(),
+        reasons=[str(value) for value in data.get("reasons", []) if str(value).strip()],
+        contradictions=[str(value) for value in data.get("contradictions", []) if str(value).strip()],
     )

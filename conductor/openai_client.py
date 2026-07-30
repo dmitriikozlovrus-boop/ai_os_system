@@ -23,12 +23,16 @@ from .models import (
     SYSTEM_ISSUE_SEVERITIES,
     SYSTEM_ISSUE_TYPES,
     Classification,
+    FeedbackEnrichment,
     IssueRecurrenceAnalysis,
     ImprovementSummary,
+    ImprovementMatchCandidate,
     SystemIssueRecord,
     SystemIssueSummary,
     TechnicalChangeProposal,
     classification_from_dict,
+    feedback_enrichment_from_dict,
+    improvement_match_candidate_from_dict,
     issue_recurrence_analysis_from_dict,
     system_issue_classification_from_dict,
     technical_change_proposal_from_dict,
@@ -287,6 +291,78 @@ TECHNICAL_CHANGE_PROPOSAL_SCHEMA: dict[str, Any] = {
         "open_questions",
         "confidence",
     ],
+}
+
+
+FEEDBACK_ENRICHMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "feedback_kind": {"type": "string", "enum": ["CONCRETE_ERROR", "GENERAL_PROBLEM", "IMPROVEMENT_IDEA", "CORRECTION", "NOT_FEEDBACK", "UNKNOWN"]},
+        "normalized_title": {"type": "string"},
+        "normalized_description": {"type": "string"},
+        "actual_behavior": {"type": "string"},
+        "expected_behavior": {"type": "string"},
+        "affected_entity_type": {"type": "string"},
+        "affected_database": {"type": "string", "enum": sorted(SYSTEM_ISSUE_DATABASES)},
+        "affected_component": {"type": "string"},
+        "severity": {"type": "string", "enum": sorted(SYSTEM_ISSUE_SEVERITIES)},
+        "is_recurring_statement": {"type": "boolean"},
+        "should_create_system_issue": {"type": "boolean"},
+        "should_find_or_create_improvement": {"type": "boolean"},
+        "proposed_improvement_title": {"type": "string"},
+        "proposed_improvement_description": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "inferred_fields": {"type": "array", "items": {"type": "string"}},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "needs_clarification": {"type": "boolean"},
+        "clarification_question": {"type": "string"},
+    },
+    "required": [
+        "feedback_kind",
+        "normalized_title",
+        "normalized_description",
+        "actual_behavior",
+        "expected_behavior",
+        "affected_entity_type",
+        "affected_database",
+        "affected_component",
+        "severity",
+        "is_recurring_statement",
+        "should_create_system_issue",
+        "should_find_or_create_improvement",
+        "proposed_improvement_title",
+        "proposed_improvement_description",
+        "confidence",
+        "inferred_fields",
+        "evidence",
+        "needs_clarification",
+        "clarification_question",
+    ],
+}
+
+
+IMPROVEMENT_MATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "improvement_id": {"type": "string"},
+                    "score": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "relation_type": {"type": "string", "enum": ["SAME_PROBLEM", "RELATED_PROBLEM", "POSSIBLE_MATCH", "NOT_RELATED"]},
+                    "reasons": {"type": "array", "items": {"type": "string"}},
+                    "contradictions": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["improvement_id", "score", "relation_type", "reasons", "contradictions"],
+            },
+        }
+    },
+    "required": ["candidates"],
 }
 
 
@@ -563,6 +639,103 @@ class OpenAIClient:
             timeout=90,
         )
         return technical_change_proposal_from_dict(json.loads(_extract_response_text(data)))
+
+    def enrich_feedback(
+        self,
+        *,
+        raw_text: str,
+        deterministic: Any,
+        interaction: dict[str, Any],
+    ) -> FeedbackEnrichment:
+        if not self.api_key:
+            raise RuntimeError("AI-анализ недоступен")
+        system = (
+            "Ты нормализуешь пользовательский feedback для backlog. "
+            "Не меняй смысл исходного текста, не выдумывай факты, перечисляй evidence и inferred_fields. "
+            "CORRECTION не должен попадать в backlog, NOT_FEEDBACK не создает System Issue."
+        )
+        payload = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "raw_feedback": raw_text,
+                            "deterministic": deterministic.__dict__,
+                            "interaction": interaction,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "conductor_feedback_enrichment",
+                    "schema": FEEDBACK_ENRICHMENT_SCHEMA,
+                    "strict": True,
+                }
+            },
+        }
+        data = request_json(
+            "POST",
+            "https://api.openai.com/v1/responses",
+            headers={**self.headers, "Content-Type": "application/json"},
+            payload=payload,
+            timeout=90,
+        )
+        return feedback_enrichment_from_dict(json.loads(_extract_response_text(data)))
+
+    def match_improvements(
+        self,
+        *,
+        feedback: Any,
+        candidates: list[ImprovementSummary],
+    ) -> list[ImprovementMatchCandidate]:
+        if not self.api_key:
+            raise RuntimeError("AI-анализ недоступен")
+        payload = {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Сравни normalized feedback с открытыми Improvements. "
+                        "SAME_PROBLEM только если это одна системная причина или одно ожидаемое изменение. "
+                        "Одна база, компонент или общее слово недостаточны."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "feedback": feedback.__dict__,
+                            "candidates": [candidate.__dict__ for candidate in candidates[:10]],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "conductor_improvement_match",
+                    "schema": IMPROVEMENT_MATCH_SCHEMA,
+                    "strict": True,
+                }
+            },
+        }
+        data = request_json(
+            "POST",
+            "https://api.openai.com/v1/responses",
+            headers={**self.headers, "Content-Type": "application/json"},
+            payload=payload,
+            timeout=90,
+        )
+        raw = json.loads(_extract_response_text(data))
+        return [improvement_match_candidate_from_dict(item) for item in raw.get("candidates", [])]
 
     def _transcription_models(self) -> list[str]:
         models = [self.transcribe_model]

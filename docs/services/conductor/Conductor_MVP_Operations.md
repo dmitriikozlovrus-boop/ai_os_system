@@ -53,6 +53,7 @@ conductor/
 - локальное хранение ожидающих уточнений в `data/pending.json`;
 - формирование черновика технического задания из `IMPROVEMENTS` при отдельном feature flag;
 - нормализацию пользовательского feedback в backlog при отдельном feature flag;
+- AI-assisted triage накопленного backlog при отдельном feature flag;
 - полную двустороннюю синхронизацию базы `TASKS` и Todoist.
 
 ## Быстрый старт
@@ -121,6 +122,7 @@ python3 -m conductor.cli "Завтра напомни написать Марк�
 - аварийная пауза Todoist sync управляется только переменной `TODOIST_SYNC_PAUSED`.
 - генерация технического задания из Improvement выключена по умолчанию и управляется `TECHNICAL_SPEC_GENERATION_ENABLED`.
 - накопительный backlog feedback выключен по умолчанию и управляется `FEEDBACK_BACKLOG_ENABLED`.
+- AI triage backlog выключен по умолчанию и управляется `BACKLOG_AI_TRIAGE_ENABLED`.
 
 ## Improvement → Codex Task
 
@@ -173,6 +175,30 @@ Feature flag:
 
 ```bash
 FEEDBACK_BACKLOG_ENABLED=false
+```
+
+## Backlog AI Triage
+
+Сценарий управляемого разбора backlog описан отдельно:
+
+```text
+docs/product/use_cases/UC_006_Backlog_AI_Triage.md
+```
+
+Операционные правила:
+
+- `BACKLOG_AI_TRIAGE_ENABLED=false` — значение по умолчанию;
+- при выключенном флаге feedback backlog работает детерминированно, а AI triage команды возвращают controlled unavailable message;
+- AI enrichment запускается только после deterministic normalization и не является источником обязательной логики;
+- semantic matching не связывает Improvement автоматически без подтверждения пользователя;
+- merge не удаляет вторичный Improvement, а переводит его в `Отложено`;
+- split доступен только как preview;
+- переход в Technical Spec flow возможен только по явному выбору пользователя и при достаточной readiness.
+
+Feature flag:
+
+```bash
+BACKLOG_AI_TRIAGE_ENABLED=false
 ```
 
 ## TASKS ↔ Todoist
@@ -383,6 +409,7 @@ NOTION_PROJECTS_DATABASE_ID
 SYSTEM_IMPROVEMENTS_ENABLED
 TECHNICAL_SPEC_GENERATION_ENABLED
 FEEDBACK_BACKLOG_ENABLED
+BACKLOG_AI_TRIAGE_ENABLED
 TODOIST_API_TOKEN
 TODOIST_WEBHOOK_SECRET
 TASK_SYNC_SECRET
@@ -569,6 +596,10 @@ SYSTEM_IMPROVEMENTS_ENABLED=false
 `FEEDBACK_BACKLOG_ENABLED=false` — безопасный режим по умолчанию. В нем normalization, накопительная summary и browsing backlog через Telegram не запускаются.
 
 `FEEDBACK_BACKLOG_ENABLED=true` включает fallback-нормализацию feedback, поиск существующего Improvement, предложение backlog item, managed summary и Telegram-команды просмотра backlog.
+
+`BACKLOG_AI_TRIAGE_ENABLED=false` — безопасный режим по умолчанию. В нем AI enrichment, semantic matching, triage, duplicate merge proposals и implementation candidates не запускаются.
+
+`BACKLOG_AI_TRIAGE_ENABLED=true` включает optional AI enrichment после deterministic normalization, semantic matching открытых Improvements, readiness-разбор backlog, clarification questions, merge preview/confirmation и безопасный handoff в existing Technical Spec flow.
 
 Ограничения MVP:
 

@@ -183,6 +183,26 @@ class InteractionStore:
             return None
         return payload
 
+    def remember_triage_list(self, chat_id: int, improvements: list[dict[str, Any]]) -> None:
+        data = self._load()
+        data.setdefault("_triage_lists", {})[str(chat_id)] = {
+            "chat_id": chat_id,
+            "items": improvements,
+            "timestamp": _now(),
+        }
+        self._save(data)
+
+    def get_triage_list(self, chat_id: int) -> dict[str, Any] | None:
+        data = self._load()
+        payload = data.get("_triage_lists", {}).get(str(chat_id))
+        if not payload:
+            return None
+        if _expired(payload.get("timestamp"), FEEDBACK_TTL):
+            data.get("_triage_lists", {}).pop(str(chat_id), None)
+            self._save(data)
+            return None
+        return payload
+
     def remember_feedback_signal(self, improvement_id: str, signal: dict[str, Any]) -> bool:
         data = self._load()
         signals = data.setdefault("_feedback_signals", {}).setdefault(improvement_id, [])
@@ -226,6 +246,9 @@ class InteractionStore:
         for chat_id, payload in list(data.get("_backlog_lists", {}).items()):
             if _expired(payload.get("timestamp"), FEEDBACK_TTL):
                 data.get("_backlog_lists", {}).pop(chat_id, None)
+        for chat_id, payload in list(data.get("_triage_lists", {}).items()):
+            if _expired(payload.get("timestamp"), FEEDBACK_TTL):
+                data.get("_triage_lists", {}).pop(chat_id, None)
         for signals in data.get("_feedback_signals", {}).values():
             if isinstance(signals, list):
                 self._prune_feedback_signals(signals)
