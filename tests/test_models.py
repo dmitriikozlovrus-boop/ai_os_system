@@ -1,9 +1,9 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from conductor.models import classification_from_dict, normalize_effort
-from conductor.notion_client import NotionClient
-from conductor.openai_client import OpenAIClient
+from conductor.models import GoodsItem, classification_from_dict, normalize_effort
+from conductor.notion_client import NotionClient, _goods_properties
+from conductor.openai_client import OpenAIClient, _postprocess_classification
 from conductor.service import (
     ConductorService,
     _apply_clarification_fallbacks,
@@ -63,6 +63,186 @@ class ModelsTest(unittest.TestCase):
         result = classification_from_dict(data)
         self.assertEqual(result.tasks[0].title, "Позвонить Марко")
         self.assertEqual(result.tasks[0].effort_minutes, 15)
+
+    def test_classification_from_dict_parses_one_goods(self):
+        result = classification_from_dict(
+            {
+                "tasks": [],
+                "studies": [],
+                "goods": [
+                    {
+                        "title": "Новый ноутбук",
+                        "status": "Не куплено",
+                        "goods_type": "Техника/электроника",
+                        "priority": "P3",
+                        "price": 20000,
+                        "currency": "MXN",
+                        "goods_user": "Работа",
+                        "usage_place": "Офис",
+                        "stream": "Бизнес",
+                        "project": "СЫРЬЕВОЙ ТРЕЙДИНГ",
+                        "url": "https://example.com/laptop",
+                        "source": "ИИ",
+                        "confidence": 0.92,
+                        "missing": [],
+                    }
+                ],
+                "notes": [],
+            }
+        )
+        self.assertEqual(result.goods[0].title, "Новый ноутбук")
+        self.assertEqual(result.goods[0].price, 20000.0)
+        self.assertEqual(result.goods[0].currency, "MXN")
+
+    def test_classification_from_dict_defaults_missing_goods_to_empty(self):
+        result = classification_from_dict({"tasks": [], "studies": [], "notes": []})
+        self.assertEqual(result.goods, [])
+
+    def test_classification_from_dict_parses_task_and_goods(self):
+        result = classification_from_dict(
+            {
+                "tasks": [
+                    {
+                        "title": "Купить ноутбук",
+                        "description": "Купить ноутбук завтра",
+                        "desired_result": "Купленный ноутбук",
+                        "project": "Общее",
+                        "area": "Личное развитие",
+                        "due_date": "2026-05-21",
+                        "effort_minutes": 15,
+                        "priority": "P2",
+                        "next_step": "Купить ноутбук",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "studies": [],
+                "goods": [
+                    {
+                        "title": "Ноутбук",
+                        "status": "Не куплено",
+                        "goods_type": "Техника/электроника",
+                        "priority": None,
+                        "price": None,
+                        "currency": None,
+                        "goods_user": None,
+                        "usage_place": None,
+                        "stream": None,
+                        "project": None,
+                        "url": None,
+                        "source": "ИИ",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "notes": [],
+            }
+        )
+        self.assertEqual(result.tasks[0].title, "Купить ноутбук")
+        self.assertEqual(result.goods[0].title, "Ноутбук")
+
+    def test_classification_from_dict_parses_study_and_goods(self):
+        result = classification_from_dict(
+            {
+                "tasks": [],
+                "studies": [
+                    {
+                        "question": "Лучшие ноутбуки до 20 000 MXN",
+                        "description": "Изучи лучшие ноутбуки до 20 000 MXN",
+                        "industry": "Техника",
+                        "research_type": "Простое",
+                        "project": None,
+                        "area": "Прочее",
+                        "priority": "P2",
+                        "result_format": "Краткая справка",
+                        "due_date": None,
+                        "source": "Telegram",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "goods": [
+                    {
+                        "title": "Ноутбук",
+                        "status": "Необходимо выбрать",
+                        "goods_type": "Техника/электроника",
+                        "priority": None,
+                        "price": 20000,
+                        "currency": "MXN",
+                        "goods_user": None,
+                        "usage_place": None,
+                        "stream": None,
+                        "project": None,
+                        "url": None,
+                        "source": "ИИ",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "notes": [],
+            }
+        )
+        self.assertEqual(result.studies[0].question, "Лучшие ноутбуки до 20 000 MXN")
+        self.assertEqual(result.goods[0].status, "Необходимо выбрать")
+
+    def test_classification_from_dict_parses_task_study_and_goods(self):
+        result = classification_from_dict(
+            {
+                "tasks": [
+                    {
+                        "title": "Купить ноутбук",
+                        "description": "Купить ноутбук",
+                        "desired_result": "Купленный ноутбук",
+                        "project": "Общее",
+                        "area": "Прочее",
+                        "due_date": "2026-05-21",
+                        "effort_minutes": 15,
+                        "priority": "P2",
+                        "next_step": "Купить ноутбук",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "studies": [
+                    {
+                        "question": "Отзывы о ноутбуке",
+                        "description": "Изучить отзывы о ноутбуке",
+                        "industry": "Техника",
+                        "research_type": "Простое",
+                        "project": None,
+                        "area": "Прочее",
+                        "priority": "P2",
+                        "result_format": "Краткая справка",
+                        "due_date": None,
+                        "source": "Telegram",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "goods": [
+                    {
+                        "title": "Ноутбук",
+                        "status": "Не куплено",
+                        "goods_type": "Техника/электроника",
+                        "priority": None,
+                        "price": None,
+                        "currency": None,
+                        "goods_user": None,
+                        "usage_place": None,
+                        "stream": None,
+                        "project": None,
+                        "url": None,
+                        "source": "ИИ",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "notes": [],
+            }
+        )
+        self.assertEqual(len(result.tasks), 1)
+        self.assertEqual(len(result.studies), 1)
+        self.assertEqual(len(result.goods), 1)
 
     def test_fallback_task_title_omits_metadata(self):
         client = OpenAIClient("", "unused", "unused")
@@ -199,6 +379,209 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result.tasks[0].due_date, "2026-05-21")
         self.assertEqual(result.tasks[0].missing, [])
         self.assertGreaterEqual(result.tasks[0].confidence, 0.85)
+
+    def test_goods_with_price_and_currency_from_fallback(self):
+        client = OpenAIClient("", "unused", "unused")
+        result = client._fallback("Подбери ноутбук до 20 000 MXN", today="2026-05-20")
+        self.assertEqual(result.goods[0].title, "Ноутбук")
+        self.assertEqual(result.goods[0].status, "Необходимо выбрать")
+        self.assertEqual(result.goods[0].price, 20000.0)
+        self.assertEqual(result.goods[0].currency, "MXN")
+
+    def test_goods_unknown_enum_values_are_cleared(self):
+        classification = classification_from_dict(
+            {
+                "tasks": [],
+                "studies": [],
+                "goods": [
+                    {
+                        "title": "Ноутбук",
+                        "status": "Новый статус",
+                        "goods_type": "Компьютеры",
+                        "priority": "P9",
+                        "price": -10,
+                        "currency": "GBP",
+                        "goods_user": "Коллега",
+                        "usage_place": "Машина",
+                        "stream": "Неизвестно",
+                        "project": None,
+                        "url": "not-a-url",
+                        "source": "Telegram",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "notes": [],
+            }
+        )
+        result = _postprocess_classification(classification, projects=[])
+        item = result.goods[0]
+        self.assertEqual(item.status, "Не куплено")
+        self.assertIsNone(item.goods_type)
+        self.assertIsNone(item.priority)
+        self.assertIsNone(item.price)
+        self.assertIsNone(item.currency)
+        self.assertIsNone(item.goods_user)
+        self.assertIsNone(item.usage_place)
+        self.assertIsNone(item.stream)
+        self.assertIsNone(item.url)
+        self.assertEqual(item.source, "ИИ")
+
+    def test_goods_without_title_marks_missing_title(self):
+        classification = classification_from_dict(
+            {
+                "tasks": [],
+                "studies": [],
+                "goods": [
+                    {
+                        "title": "",
+                        "status": None,
+                        "goods_type": None,
+                        "priority": None,
+                        "price": None,
+                        "currency": None,
+                        "goods_user": None,
+                        "usage_place": None,
+                        "stream": None,
+                        "project": None,
+                        "url": None,
+                        "source": None,
+                        "confidence": 0.8,
+                        "missing": [],
+                    }
+                ],
+                "notes": [],
+            }
+        )
+        result = _postprocess_classification(classification, projects=[])
+        self.assertIn("title", result.goods[0].missing)
+
+    def test_pending_goods_can_resolve_without_ai(self):
+        pending_item = {
+            "payload": {
+                "type": "goods",
+                "item": {
+                    "title": "",
+                    "status": "Не куплено",
+                    "goods_type": None,
+                    "priority": None,
+                    "price": None,
+                    "currency": None,
+                    "goods_user": None,
+                    "usage_place": None,
+                    "stream": None,
+                    "project": None,
+                    "url": None,
+                    "source": "ИИ",
+                    "confidence": 0.4,
+                    "missing": ["title"],
+                },
+            },
+            "questions": ["Какой товар или предмет нужно сохранить?"],
+        }
+        result = _resolve_pending_without_ai(pending_item, "Новый ноутбук", today="2026-05-20", projects=[])
+        self.assertIsNotNone(result)
+        self.assertEqual(result.goods[0].title, "Новый ноутбук")
+        self.assertEqual(result.goods[0].missing, [])
+        self.assertGreaterEqual(result.goods[0].confidence, 0.85)
+
+    def test_goods_notion_property_mapping(self):
+        item = GoodsItem(
+            title="Новый ноутбук",
+            status="Необходимо выбрать",
+            goods_type="Техника/электроника",
+            priority="P3",
+            price=20000.0,
+            currency="MXN",
+            goods_user="Работа",
+            usage_place="Офис",
+            stream="Бизнес",
+            project="СЫРЬЕВОЙ ТРЕЙДИНГ",
+            url="https://example.com/laptop",
+            source="ИИ",
+            confidence=0.9,
+            missing=[],
+        )
+        properties = _goods_properties(item, project_id="project-id")
+        self.assertEqual(properties["Наименование предмета"], {"title": [{"type": "text", "text": {"content": "Новый ноутбук"}}]})
+        self.assertEqual(properties["Статус"], {"status": {"name": "Необходимо выбрать"}})
+        self.assertEqual(properties["Тип товара"], {"select": {"name": "Техника/электроника"}})
+        self.assertEqual(properties["Приоритет"], {"select": {"name": "P3"}})
+        self.assertEqual(properties["Цена"], {"number": 20000.0})
+        self.assertEqual(properties["Валюта"], {"select": {"name": "MXN"}})
+        self.assertEqual(properties["Пользователь товара"], {"select": {"name": "Работа"}})
+        self.assertEqual(properties["Место использования"], {"select": {"name": "Офис"}})
+        self.assertEqual(properties["Стрим"], {"select": {"name": "Бизнес"}})
+        self.assertEqual(properties["Проект"], {"relation": [{"id": "project-id"}]})
+        self.assertEqual(properties["Ссылка"], {"url": "https://example.com/laptop"})
+        self.assertEqual(properties["Источник"], {"select": {"name": "ИИ"}})
+
+    def test_goods_notion_error_does_not_break_task_or_study(self):
+        service = object.__new__(ConductorService)
+        service.settings = Mock(confidence_threshold=0.70)
+        service.notion = Mock()
+        service.notion.create_task.return_value = "task-url"
+        service.notion.create_study.return_value = "study-url"
+        service.notion.create_goods.side_effect = RuntimeError("notion goods failed")
+        classification = classification_from_dict(
+            {
+                "tasks": [
+                    {
+                        "title": "Написать Марко",
+                        "description": "Написать Марко",
+                        "desired_result": "Отправленное письмо",
+                        "project": "Общее",
+                        "area": "Прочее",
+                        "due_date": "2026-05-21",
+                        "effort_minutes": 15,
+                        "priority": "P2",
+                        "next_step": "Написать Марко",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "studies": [
+                    {
+                        "question": "Отзывы о ноутбуке",
+                        "description": "Изучить отзывы",
+                        "industry": "Техника",
+                        "research_type": "Простое",
+                        "project": "Общее",
+                        "area": "Прочее",
+                        "priority": "P2",
+                        "result_format": "Краткая справка",
+                        "due_date": "2026-05-21",
+                        "source": "Telegram",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "goods": [
+                    {
+                        "title": "Ноутбук",
+                        "status": "Не куплено",
+                        "goods_type": "Техника/электроника",
+                        "priority": None,
+                        "price": None,
+                        "currency": None,
+                        "goods_user": None,
+                        "usage_place": None,
+                        "stream": None,
+                        "project": None,
+                        "url": None,
+                        "source": "ИИ",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "notes": [],
+            }
+        )
+        result = service._handle_classification(classification, chat_id=None, source="Telegram", projects=[])
+        self.assertEqual(result["tasks_created"], ["task-url"])
+        self.assertEqual(result["studies_created"], ["study-url"])
+        self.assertEqual(result["goods_created"], [])
+        self.assertIn("Не удалось создать товар", result["errors"][0])
 
     def test_edit_request_without_pending_returns_guidance(self):
         service = object.__new__(ConductorService)

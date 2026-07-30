@@ -45,9 +45,11 @@ conductor/
 - текстовые сообщения;
 - голосовые и аудиосообщения через Telegram file API и OpenAI transcription;
 - AI-классификацию на задачи и вопросы на изучение;
+- AI-классификацию на товары;
 - уточнения в Telegram, если не хватает проекта, срока или уверенность ниже порога;
 - создание задач в Notion `Tasks`;
 - создание записей в Notion `Study / На изучение`;
+- создание записей в Notion `GOODS`;
 - локальное хранение ожидающих уточнений в `data/pending.json`;
 - полную двустороннюю синхронизацию базы `TASKS` и Todoist.
 
@@ -99,6 +101,7 @@ python3 -m conductor.cli "Завтра напомни написать Марк�
 |---|---|
 | `Tasks` | `be9d26fe652b474696cd5de0118b1210` |
 | `Study / На изучение` | `4e27e10ca2bf44a08b4c8f86c7a125bd` |
+| `GOODS` | `33a5dafd-5ed3-4f55-b378-16db3571f3dc` |
 | `Projects / Приоритеты` | `bbb501a6933941b4837afff250479f0e` |
 
 ## Важная логика MVP
@@ -108,6 +111,7 @@ python3 -m conductor.cli "Завтра напомни написать Марк�
 - если срок не указан, `Conductor` спрашивает срок;
 - если проект не найден или уверенность ниже `CONFIDENCE_THRESHOLD`, `Conductor` спрашивает уточнение;
 - если в сообщении есть и задачи, и вопросы на изучение, создаются обе сущности;
+- если в сообщении есть задачи, вопросы на изучение и товары, создаются соответствующие сущности;
 - исходный `RAW` отдельно не сохраняется;
 - Todoist включается при наличии `TODOIST_API_TOKEN`;
 - аварийная пауза Todoist sync управляется только переменной `TODOIST_SYNC_PAUSED`.
@@ -313,6 +317,7 @@ OPENAI_API_KEY
 NOTION_TOKEN
 NOTION_TASKS_DATABASE_ID
 NOTION_STUDY_DATABASE_ID
+NOTION_GOODS_DATABASE_ID
 NOTION_PROJECTS_DATABASE_ID
 TODOIST_API_TOKEN
 TODOIST_WEBHOOK_SECRET

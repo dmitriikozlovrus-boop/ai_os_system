@@ -9,6 +9,20 @@ TASK_PRIORITIES = {"P1", "P2", "P3"}
 PROJECT_PRIORITIES = {"P1", "P2", "P3", "P4"}
 RESEARCH_TYPES = {"Простое", "Глубокое"}
 RESULT_FORMATS = {"Краткая справка", "Подробная справка", "Memo", "Таблица", "Telegram-дайджест"}
+GOODS_STATUSES = {"Не куплено", "Необходимо выбрать", "В процессе", "Необходимо одобрить выбор", "Куплено"}
+GOODS_TYPES = {
+    "Техника/электроника",
+    "Дом/быт",
+    "Одежда/обувь",
+    "Здоровье/красота",
+    "Еда/напитки",
+    "Хобби/спорт",
+    "Подарок",
+    "Другое",
+}
+GOODS_CURRENCIES = {"MXN", "USD", "EUR", "RUB"}
+GOODS_USERS = {"Личное", "Семья", "Ребёнок", "Партнёр/партнёрша", "Дом", "Работа", "Подарок", "Другое"}
+GOODS_USAGE_PLACES = {"Дом", "Офис", "Поездки", "Подарок", "Другое"}
 
 
 @dataclass
@@ -43,10 +57,29 @@ class StudyItem:
 
 
 @dataclass
+class GoodsItem:
+    title: str
+    status: str | None
+    goods_type: str | None
+    priority: str | None
+    price: float | None
+    currency: str | None
+    goods_user: str | None
+    usage_place: str | None
+    stream: str | None
+    project: str | None
+    url: str | None
+    source: str | None
+    confidence: float
+    missing: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Classification:
     tasks: list[TaskItem]
     studies: list[StudyItem]
-    notes: list[str]
+    goods: list[GoodsItem] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -63,6 +96,22 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_number(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def normalize_effort(minutes: int | None) -> str | None:
@@ -117,4 +166,25 @@ def classification_from_dict(data: dict[str, Any]) -> Classification:
             )
         )
 
-    return Classification(tasks=tasks, studies=studies, notes=[str(x) for x in data.get("notes", [])])
+    goods = []
+    for item in data.get("goods", []) or []:
+        goods.append(
+            GoodsItem(
+                title=str(item.get("title") or "").strip(),
+                status=_as_optional_str(item.get("status")),
+                goods_type=_as_optional_str(item.get("goods_type")),
+                priority=_as_optional_str(item.get("priority")),
+                price=_as_number(item.get("price")),
+                currency=_as_optional_str(item.get("currency")),
+                goods_user=_as_optional_str(item.get("goods_user")),
+                usage_place=_as_optional_str(item.get("usage_place")),
+                stream=_as_optional_str(item.get("stream")),
+                project=_as_optional_str(item.get("project")),
+                url=_as_optional_str(item.get("url")),
+                source=_as_optional_str(item.get("source")),
+                confidence=_as_float(item.get("confidence"), 0.0),
+                missing=[str(x) for x in item.get("missing", [])],
+            )
+        )
+
+    return Classification(tasks=tasks, studies=studies, goods=goods, notes=[str(x) for x in data.get("notes", [])])

@@ -37,6 +37,7 @@ class Settings:
     notion_token: str
     notion_tasks_database_id: str
     notion_study_database_id: str
+    notion_goods_database_id: str
     notion_projects_database_id: str
     notion_streams_database_id: str
     host: str
@@ -77,6 +78,7 @@ def get_settings() -> Settings:
         notion_token=os.getenv("NOTION_TOKEN", ""),
         notion_tasks_database_id=os.getenv("NOTION_TASKS_DATABASE_ID", ""),
         notion_study_database_id=os.getenv("NOTION_STUDY_DATABASE_ID", ""),
+        notion_goods_database_id=os.getenv("NOTION_GOODS_DATABASE_ID", ""),
         notion_projects_database_id=os.getenv("NOTION_PROJECTS_DATABASE_ID", ""),
         notion_streams_database_id=os.getenv("NOTION_STREAMS_DATABASE_ID", ""),
         host=os.getenv("HOST", "0.0.0.0"),

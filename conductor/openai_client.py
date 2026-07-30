@@ -6,7 +6,17 @@ from datetime import date, timedelta
 from typing import Any
 
 from .http import HttpError, request_json, request_multipart
-from .models import Classification, classification_from_dict
+from .models import (
+    AREAS,
+    GOODS_CURRENCIES,
+    GOODS_STATUSES,
+    GOODS_TYPES,
+    GOODS_USAGE_PLACES,
+    GOODS_USERS,
+    PROJECT_PRIORITIES,
+    Classification,
+    classification_from_dict,
+)
 
 
 CLASSIFIER_SCHEMA: dict[str, Any] = {
@@ -84,9 +94,73 @@ CLASSIFIER_SCHEMA: dict[str, Any] = {
                 ],
             },
         },
+        "goods": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "status": {
+                        "type": ["string", "null"],
+                        "enum": ["Не куплено", "Необходимо выбрать", "В процессе", "Необходимо одобрить выбор", "Куплено", None],
+                    },
+                    "goods_type": {
+                        "type": ["string", "null"],
+                        "enum": [
+                            "Техника/электроника",
+                            "Дом/быт",
+                            "Одежда/обувь",
+                            "Здоровье/красота",
+                            "Еда/напитки",
+                            "Хобби/спорт",
+                            "Подарок",
+                            "Другое",
+                            None,
+                        ],
+                    },
+                    "priority": {"type": ["string", "null"], "enum": ["P1", "P2", "P3", "P4", None]},
+                    "price": {"type": ["number", "null"]},
+                    "currency": {"type": ["string", "null"], "enum": ["MXN", "USD", "EUR", "RUB", None]},
+                    "goods_user": {
+                        "type": ["string", "null"],
+                        "enum": ["Личное", "Семья", "Ребёнок", "Партнёр/партнёрша", "Дом", "Работа", "Подарок", "Другое", None],
+                    },
+                    "usage_place": {
+                        "type": ["string", "null"],
+                        "enum": ["Дом", "Офис", "Поездки", "Подарок", "Другое", None],
+                    },
+                    "stream": {
+                        "type": ["string", "null"],
+                        "enum": ["Работа", "Бизнес", "Личное развитие", "Семья", "Прочее", None],
+                    },
+                    "project": {"type": ["string", "null"]},
+                    "url": {"type": ["string", "null"]},
+                    "source": {"type": ["string", "null"], "enum": ["Вручную", "ИИ", None]},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "missing": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "title",
+                    "status",
+                    "goods_type",
+                    "priority",
+                    "price",
+                    "currency",
+                    "goods_user",
+                    "usage_place",
+                    "stream",
+                    "project",
+                    "url",
+                    "source",
+                    "confidence",
+                    "missing",
+                ],
+            },
+        },
         "notes": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["tasks", "studies", "notes"],
+    "required": ["tasks", "studies", "goods", "notes"],
 }
 
 
@@ -113,6 +187,13 @@ class OpenAIClient:
             "Ты классификатор сервиса 'Дирижер'. Работай строго по ТЗ:\n"
             "- Задача = любое действие кроме простого чтения/изучения.\n"
             "- Вопрос на изучение = чтение, просмотр, анализ информации или справка.\n"
+            "- Goods = конкретный товар, предмет, устройство или объект, который пользователь хочет купить, выбрать, найти, заменить или учитывать.\n"
+            "- Task = действие пользователя. Одно сообщение может содержать одновременно Goods и Task.\n"
+            "- Запрос 'купить X' обычно содержит Goods: X и Task: купить X, если действие нужно сохранить как отдельную задачу.\n"
+            "- Запрос 'нужен X' обычно содержит только Goods.\n"
+            "- Запрос 'подобрать X' создает Goods со статусом 'Необходимо выбрать'.\n"
+            "- Не создавай Study автоматически только потому, что товар нужно выбрать; Study нужен только при явном изучении/сравнении/анализе.\n"
+            "- Не создавай Goods для абстрактной темы исследования без конкретного предмета покупки.\n"
             "- Не мельчи: объединяй близкие действия в одну сущность, если это один смысловой результат.\n"
             "- Если проект неясен, поставь project=null и добавь 'project' в missing.\n"
             "- Если срок не указан, поставь due_date=null и добавь 'due_date' в missing.\n"
@@ -126,6 +207,8 @@ class OpenAIClient:
             "- desired_result формулируй как завершенный артефакт или завершенное действие: 'Подготовленная справка', 'Совершенный звонок', 'Отправленное письмо'.\n"
             "- effort_minutes оценивай консервативно, как среднюю трудозатратность специалиста уровня 4 из 10.\n"
             "- industry определи коротким названием отрасли.\n"
+            "- Для Goods используй source='ИИ', status='Не куплено' по умолчанию; если пользователь просит подобрать или выбрать товар, status='Необходимо выбрать'.\n"
+            "- Для Goods не придумывай priority, price, currency, goods_user, usage_place, stream, project или url.\n"
             "- Расширяй описание так, чтобы через месяц было понятно, что сделать и зачем.\n"
             "- Даты возвращай ISO YYYY-MM-DD. Сегодня: " + today + ".\n"
             "Направления: Работа, Бизнес, Личное развитие, Семья, Прочее.\n"
@@ -202,10 +285,36 @@ class OpenAIClient:
         projects: list[dict[str, str]] | None = None,
         note: str = "fallback classifier",
     ) -> Classification:
-        task_words = ("позвон", "напиш", "напис", "найти", "посчит", "подготов", "договор", "сдел", "отправ", "напом")
+        task_words = (
+            "позвон",
+            "напиш",
+            "напис",
+            "найти",
+            "посчит",
+            "подготов",
+            "договор",
+            "сдел",
+            "отправ",
+            "напом",
+            "купить",
+            "приобрести",
+            "заказать",
+        )
         study_words = ("изуч", "разобраться в", "исслед", "собрать справ")
+        goods_words = (
+            "купить",
+            "нужен",
+            "нужна",
+            "нужно приобрести",
+            "подобрать",
+            "подбери",
+            "выбрать",
+            "выбери",
+            "заказать",
+            "закажи",
+        )
         lower = text.lower()
-        data: dict[str, Any] = {"tasks": [], "studies": [], "notes": [note]}
+        data: dict[str, Any] = {"tasks": [], "studies": [], "goods": [], "notes": [note]}
         task_text, study_text = _split_task_and_study(text)
         if any(word in lower for word in task_words):
             source = task_text or text
@@ -251,6 +360,31 @@ class OpenAIClient:
                     "missing": _missing(project=project, area=_normalize_area(area), due_date=due_date),
                 }
             )
+        if any(word in lower for word in goods_words):
+            price, currency = _extract_price_and_currency(text)
+            status = (
+                "Необходимо выбрать"
+                if any(word in lower for word in ("подобрать", "подбери", "выбрать", "выбери"))
+                else "Не куплено"
+            )
+            data["goods"].append(
+                {
+                    "title": _extract_goods_title(text),
+                    "status": status,
+                    "goods_type": _infer_goods_type(text),
+                    "priority": None,
+                    "price": price,
+                    "currency": currency,
+                    "goods_user": _infer_goods_user(text),
+                    "usage_place": _infer_usage_place(text),
+                    "stream": _extract_goods_stream(text),
+                    "project": _extract_after(text, r"по проекту\s+([^,.]+)"),
+                    "url": _extract_url(text),
+                    "source": "ИИ",
+                    "confidence": 0.8,
+                    "missing": [],
+                }
+            )
         classification = classification_from_dict(data)
         return _postprocess_classification(classification, projects=projects or [])
 
@@ -270,6 +404,30 @@ def _extract_after(text: str, pattern: str) -> str | None:
 def _extract_minutes(text: str) -> int | None:
     match = re.search(r"(\d+)\s*(?:минут|мин|м\b)", text, flags=re.IGNORECASE)
     return int(match.group(1)) if match else None
+
+
+def _extract_price_and_currency(text: str) -> tuple[float | None, str | None]:
+    match = re.search(r"(\d+(?:[\s.,]\d{3})*(?:[.,]\d+)?)\s*(MXN|USD|EUR|RUB)?", text, flags=re.IGNORECASE)
+    if not match:
+        return None, None
+    raw = match.group(1).replace(" ", "")
+    if "," in raw and "." not in raw:
+        raw = raw.replace(",", ".") if len(raw.rsplit(",", 1)[-1]) != 3 else raw.replace(",", "")
+    else:
+        raw = raw.replace(",", "")
+    try:
+        price = float(raw)
+    except ValueError:
+        return None, None
+    if price < 0:
+        return None, None
+    currency = match.group(2).upper() if match.group(2) else None
+    return price, currency if currency in GOODS_CURRENCIES else None
+
+
+def _extract_url(text: str) -> str | None:
+    match = re.search(r"https?://\S+", text)
+    return match.group(0).rstrip(".,)") if match else None
 
 
 def _extract_due_date(text: str, today: str | None) -> str | None:
@@ -326,6 +484,20 @@ def _clean_title(text: str, *, prefixes: tuple[str, ...], kind: str = "generic")
             break
     value = _strip_metadata_from_title(value, kind=kind)
     return _capitalize_first_letter(_first_sentence(value)[:120])
+
+
+def _extract_goods_title(text: str) -> str:
+    value = text.strip()
+    replacements = (
+        r"^\s*(?:люба,\s*)?(?:нужен|нужна|нужно приобрести|купить|подобрать|подбери|выбрать|выбери|заказать|закажи)\s+",
+    )
+    for pattern in replacements:
+        value = re.sub(pattern, "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+до\s+\d+(?:[\s.,]\d{3})*(?:[.,]\d+)?\s*(?:MXN|USD|EUR|RUB)?", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+по проекту\s+[^,.]+", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+направлени[ея]\s+[^,.]+", "", value, flags=re.IGNORECASE)
+    value = _extract_url(value) and value.replace(_extract_url(value) or "", "") or value
+    return _capitalize_first_letter(_first_sentence(value).strip(" .,\n\t")[:120])
 
 
 def _strip_metadata_from_title(text: str, *, kind: str) -> str:
@@ -402,6 +574,57 @@ def _wants_deep_research(text: str) -> bool:
     return any(marker in lower for marker in ("глубок", "подроб", "детальн", "развернут"))
 
 
+def _infer_goods_type(text: str) -> str | None:
+    lower = text.lower()
+    if any(word in lower for word in ("ноутбук", "телефон", "планшет", "компьютер", "наушник", "гаджет")):
+        return "Техника/электроника"
+    if any(word in lower for word in ("диван", "стол", "стул", "ламп", "пылесос", "кухн")):
+        return "Дом/быт"
+    if any(word in lower for word in ("ботин", "кроссов", "куртк", "рубаш", "плать", "обув")):
+        return "Одежда/обувь"
+    if any(word in lower for word in ("витамин", "крем", "шампун", "лекар")):
+        return "Здоровье/красота"
+    if any(word in lower for word in ("кофе", "чай", "еда", "напит")):
+        return "Еда/напитки"
+    if any(word in lower for word in ("спорт", "велосипед", "гантел", "хобби")):
+        return "Хобби/спорт"
+    if "подар" in lower:
+        return "Подарок"
+    return None
+
+
+def _infer_goods_user(text: str) -> str | None:
+    lower = text.lower()
+    if "реб" in lower or "сын" in lower or "доч" in lower:
+        return "Ребёнок"
+    if "подар" in lower:
+        return "Подарок"
+    if "для дома" in lower:
+        return "Дом"
+    if "для работы" in lower:
+        return "Работа"
+    if "для семьи" in lower:
+        return "Семья"
+    return None
+
+
+def _infer_usage_place(text: str) -> str | None:
+    lower = text.lower()
+    if "для дома" in lower or "домой" in lower:
+        return "Дом"
+    if "для офиса" in lower or "в офис" in lower:
+        return "Офис"
+    if "поезд" in lower or "дорог" in lower:
+        return "Поездки"
+    if "подар" in lower:
+        return "Подарок"
+    return None
+
+
+def _extract_goods_stream(text: str) -> str | None:
+    return _normalize_area(_extract_after(text, r"(?:стрим|направлени[ея])\s+([^,.]+)"))
+
+
 def _extract_response_text(data: dict[str, Any]) -> str:
     if isinstance(data.get("output_text"), str):
         return data["output_text"]
@@ -462,6 +685,28 @@ def _postprocess_classification(classification: Classification, *, projects: lis
         _ensure_missing(item.missing, "project", when=not item.project)
         _ensure_missing(item.missing, "area", when=not item.area)
 
+    for item in classification.goods:
+        item.title = _clean_title(item.title, prefixes=(), kind="goods")
+        item.status = item.status if item.status in GOODS_STATUSES else "Не куплено"
+        item.goods_type = item.goods_type if item.goods_type in GOODS_TYPES else None
+        item.priority = item.priority if item.priority in PROJECT_PRIORITIES else None
+        if item.price is not None and item.price < 0:
+            item.price = None
+        item.currency = item.currency if item.currency in GOODS_CURRENCIES else None
+        item.goods_user = item.goods_user if item.goods_user in GOODS_USERS else None
+        item.usage_place = item.usage_place if item.usage_place in GOODS_USAGE_PLACES else None
+        item.stream = _normalize_area(item.stream)
+        if item.stream not in AREAS:
+            item.stream = None
+        item.url = item.url if _valid_url(item.url) else None
+        item.source = "ИИ"
+        matched_project = _match_project(item.project, project_map)
+        if matched_project:
+            item.project = matched_project["name"]
+        elif item.project and project_map:
+            item.project = None
+        _ensure_missing(item.missing, "title", when=not item.title)
+
     return classification
 
 
@@ -481,6 +726,10 @@ def _ensure_missing(missing: list[str], field: str, *, when: bool = True) -> Non
         return
     if field in missing:
         missing[:] = [value for value in missing if value != field]
+
+
+def _valid_url(value: str | None) -> bool:
+    return bool(value and re.match(r"^https?://[^\s]+$", value))
 
 
 def _normalize_birthday_task_title(title: str, description: str) -> str:

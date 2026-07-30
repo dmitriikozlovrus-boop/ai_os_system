@@ -4,7 +4,7 @@ from datetime import date
 from typing import Any
 
 from .config import Settings
-from .models import Classification, StudyItem, TaskItem
+from .models import Classification, GoodsItem, StudyItem, TaskItem
 from .notion_client import NotionClient
 from .openai_client import OpenAIClient, _extract_due_date, _normalize_area
 from .pending import PendingStore
@@ -28,6 +28,7 @@ class ConductorService:
             settings.notion_tasks_database_id,
             settings.notion_study_database_id,
             settings.notion_projects_database_id,
+            settings.notion_goods_database_id,
         )
         self.telegram = TelegramClient(settings.telegram_bot_token)
         # A configured token is enough to enable the client. The dedicated
@@ -87,7 +88,7 @@ class ConductorService:
         except Exception as exc:  # noqa: BLE001 - notify the user instead of returning a webhook 502.
             if chat_id is not None:
                 self.telegram.send_message(chat_id, f"Не смог разобрать сообщение через AI: {exc}")
-            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
         if pending_item:
             classification = _apply_clarification_fallbacks(classification)
         return self._handle_classification(
@@ -115,7 +116,7 @@ class ConductorService:
                     chat_id,
                     f"Не смогла расшифровать голосовое: {exc}. Пока можно прислать текстом, а я продолжу разбор.",
                 )
-            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
         result = self.process_text(text, chat_id=chat_id, source=source)
         result["transcript"] = text
         return result
@@ -124,7 +125,7 @@ class ConductorService:
         recent = self.recent.get(chat_id)
         if not recent:
             self.telegram.send_message(chat_id, _edit_guidance_message())
-            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
         try:
             projects = self.notion.list_projects()
         except Exception as exc:  # noqa: BLE001
@@ -134,7 +135,7 @@ class ConductorService:
         updated = _apply_edit_to_recent(recent, text, today=date.today().isoformat(), projects=projects)
         if not updated:
             self.telegram.send_message(chat_id, _edit_guidance_message())
-            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
 
         try:
             if updated["type"] == "task":
@@ -147,10 +148,10 @@ class ConductorService:
                 classification = Classification(tasks=[], studies=[item], notes=["edited recent study"])
         except Exception as exc:  # noqa: BLE001
             self.telegram.send_message(chat_id, f"Не смогла обновить запись: {exc}")
-            return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [str(exc)], "notes": ["edit failed"]}
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["edit failed"]}
         self.recent.save(chat_id, updated)
         self.telegram.send_message(chat_id, _format_updated_summary(classification))
-        return {"tasks_created": [], "studies_created": [], "pending": 0, "errors": [], "notes": classification.notes}
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": classification.notes}
 
     def _handle_classification(
         self,
@@ -163,6 +164,7 @@ class ConductorService:
     ) -> dict[str, Any]:
         created_tasks: list[str] = []
         created_studies: list[str] = []
+        created_goods: list[str] = []
         pending_count = 0
         errors: list[str] = []
 
@@ -196,13 +198,29 @@ class ConductorService:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"Не удалось создать вопрос на изучение '{item.question}': {exc}")
 
+        for item in classification.goods:
+            questions = self._goods_questions(item)
+            if questions and chat_id is not None:
+                self.pending.add(chat_id, {"type": "goods", "item": item.__dict__}, questions)
+                pending_count += 1
+                self.telegram.send_message(chat_id, _format_questions(item.title or "Товар", questions))
+                continue
+            try:
+                url = self.notion.create_goods(item, projects=projects)
+                created_goods.append(url)
+                if chat_id is not None:
+                    self.recent.save(chat_id, _recent_payload("goods", url, item.__dict__))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"Не удалось создать товар '{item.title}': {exc}")
+
         if chat_id is not None and errors:
             self.telegram.send_message(chat_id, "\n".join(errors))
-        if chat_id is not None and (created_tasks or created_studies):
+        if chat_id is not None and (created_tasks or created_studies or created_goods):
             self.telegram.send_message(chat_id, _format_created_summary(classification, from_clarification=from_clarification))
         return {
             "tasks_created": created_tasks,
             "studies_created": created_studies,
+            "goods_created": created_goods,
             "pending": pending_count,
             "errors": errors,
             "notes": classification.notes,
@@ -232,6 +250,14 @@ class ConductorService:
             questions.append("Какое направление: Работа, Бизнес, Личное развитие, Семья или Прочее?")
         if _needs_study_questions(item):
             questions.append("Какие именно вопросы должны войти в исследование?")
+        return questions
+
+    def _goods_questions(self, item: GoodsItem) -> list[str]:
+        questions: list[str] = []
+        if item.confidence < self.settings.confidence_threshold:
+            questions.append("Это товар для покупки/выбора?")
+        if "title" in item.missing or not item.title:
+            questions.append("Какой товар или предмет нужно сохранить?")
         return questions
 
 
@@ -277,6 +303,15 @@ def _format_created_summary(classification: Classification, *, from_clarificatio
                 f"Формат результата: {item.result_format}",
             ]
         )
+    for item in classification.goods:
+        lines.extend(
+            [
+                f"Создан товар: {item.title}",
+                f"Статус: {item.status or 'Не куплено'}",
+                f"Цена: {item.price}" if item.price is not None else "Цена: Не указана",
+                f"Валюта: {item.currency or 'Не указана'}",
+            ]
+        )
     lines.append("Если что-то не так, напиши одним сообщением, что изменить.")
     return "\n".join(lines)
 
@@ -304,6 +339,15 @@ def _format_updated_summary(classification: Classification) -> str:
                 f"Формат результата: {item.result_format}",
             ]
         )
+    for item in classification.goods:
+        lines.extend(
+            [
+                f"Товар: {item.title}",
+                f"Статус: {item.status or 'Не куплено'}",
+                f"Цена: {item.price}" if item.price is not None else "Цена: Не указана",
+                f"Валюта: {item.currency or 'Не указана'}",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -326,6 +370,9 @@ def _apply_clarification_fallbacks(classification: Classification) -> Classifica
             item.area = "Прочее"
         if "area" in item.missing:
             item.missing = [value for value in item.missing if value != "area"]
+    for item in classification.goods:
+        if "title" in item.missing and item.title:
+            item.missing = [value for value in item.missing if value != "title"]
     return classification
 
 
@@ -359,7 +406,7 @@ def _resolve_pending_without_ai(
     payload = pending_item.get("payload", {})
     item_type = payload.get("type")
     raw_item = payload.get("item", {})
-    if item_type not in {"task", "study"} or not raw_item:
+    if item_type not in {"task", "study", "goods"} or not raw_item:
         return None
 
     item = dict(raw_item)
@@ -379,6 +426,8 @@ def _resolve_pending_without_ai(
         pending_item.get("questions", [])
     ):
         item["description"] = f"{item.get('description', '').strip()}\n\nУточнение пользователя: {answer.strip()}".strip()
+    if item_type == "goods" and not str(item.get("title") or "").strip():
+        item["title"] = answer.strip()
 
     missing = list(item.get("missing", []))
     if item.get("project"):
@@ -387,6 +436,8 @@ def _resolve_pending_without_ai(
         missing = [value for value in missing if value != "area"]
     if item.get("due_date"):
         missing = [value for value in missing if value != "due_date"]
+    if item_type == "goods" and item.get("title"):
+        missing = [value for value in missing if value != "title"]
     item["missing"] = missing
 
     if missing:
@@ -395,7 +446,9 @@ def _resolve_pending_without_ai(
     item["confidence"] = max(float(item.get("confidence") or 0.0), 0.85)
     if item_type == "task":
         return Classification(tasks=[TaskItem(**item)], studies=[], notes=["resolved pending clarification"])
-    return Classification(tasks=[], studies=[StudyItem(**item)], notes=["resolved pending clarification"])
+    if item_type == "study":
+        return Classification(tasks=[], studies=[StudyItem(**item)], notes=["resolved pending clarification"])
+    return Classification(tasks=[], studies=[], goods=[GoodsItem(**item)], notes=["resolved pending clarification"])
 
 
 def _extract_project_from_answer(answer: str, projects: list[dict[str, str]]) -> str | None:

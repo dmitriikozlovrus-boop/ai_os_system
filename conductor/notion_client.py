@@ -3,18 +3,19 @@ from __future__ import annotations
 from typing import Any
 
 from .http import request_json
-from .models import StudyItem, TaskItem
+from .models import GoodsItem, StudyItem, TaskItem
 
 
 NOTION_VERSION = "2022-06-28"
 
 
 class NotionClient:
-    def __init__(self, token: str, tasks_db: str, study_db: str, projects_db: str):
+    def __init__(self, token: str, tasks_db: str, study_db: str, projects_db: str, goods_db: str = ""):
         self.token = token
         self.tasks_db = tasks_db
         self.study_db = study_db
         self.projects_db = projects_db
+        self.goods_db = goods_db
 
     @property
     def headers(self) -> dict[str, str]:
@@ -66,6 +67,15 @@ class NotionClient:
 
     def create_study(self, item: StudyItem) -> str:
         payload = {"parent": {"database_id": self.study_db}, "properties": _study_properties(item)}
+        data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
+        return data.get("url", "")
+
+    def create_goods(self, item: GoodsItem, *, projects: list[dict[str, str]] | None = None) -> str:
+        project_id = self._find_project_id(item.project, projects=projects)
+        payload = {
+            "parent": {"database_id": self.goods_db},
+            "properties": _goods_properties(item, project_id=project_id),
+        }
         data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
         return data.get("url", "")
 
@@ -160,6 +170,30 @@ def _study_properties(item: StudyItem) -> dict[str, Any]:
     return properties
 
 
+def _goods_properties(item: GoodsItem, *, project_id: str | None = None) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "Наименование предмета": _title_prop(item.title),
+        "Статус": _status_prop(item.status or "Не куплено"),
+        "Источник": _select_prop(item.source or "ИИ"),
+    }
+    optional_props = {
+        "Тип товара": _select_prop(item.goods_type) if item.goods_type else None,
+        "Приоритет": _select_prop(item.priority) if item.priority else None,
+        "Цена": _number_prop(item.price) if item.price is not None else None,
+        "Валюта": _select_prop(item.currency) if item.currency else None,
+        "Пользователь товара": _select_prop(item.goods_user) if item.goods_user else None,
+        "Место использования": _select_prop(item.usage_place) if item.usage_place else None,
+        "Стрим": _select_prop(item.stream) if item.stream else None,
+        "Ссылка": _url_prop(item.url) if item.url else None,
+    }
+    for name, prop in optional_props.items():
+        if prop is not None:
+            properties[name] = prop
+    if project_id:
+        properties["Проект"] = {"relation": [{"id": project_id}]}
+    return properties
+
+
 def _title(prop: dict[str, Any] | None) -> str:
     if not prop:
         return ""
@@ -191,6 +225,14 @@ def _status_prop(value: str) -> dict[str, Any]:
 
 def _date_prop(value: str) -> dict[str, Any]:
     return {"date": {"start": value}}
+
+
+def _number_prop(value: float) -> dict[str, Any]:
+    return {"number": value}
+
+
+def _url_prop(value: str) -> dict[str, Any]:
+    return {"url": value}
 
 
 def _priority(value: str | None) -> str:
