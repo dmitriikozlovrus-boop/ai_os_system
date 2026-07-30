@@ -112,6 +112,15 @@ def handle_update(update: dict[str, Any]) -> dict[str, Any]:
     reply_to_message_id = None
     if isinstance(message.get("reply_to_message"), dict):
         reply_to_message_id = message["reply_to_message"].get("message_id")
+    print(
+        "TELEGRAM_UPDATE_RECEIVED "
+        f"chat_id={chat_id} "
+        f"message_id={message_id} "
+        f"reply_to_message_id={reply_to_message_id} "
+        f"has_text={bool(text.strip())} "
+        f"file_kind={file_info.get('kind') if file_info else None}",
+        flush=True,
+    )
 
     if file_info and file_info.get("kind") in {"voice", "audio"}:
         file_path, data = service.telegram.get_file_bytes(file_info["file_id"])
