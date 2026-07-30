@@ -8,11 +8,22 @@ from typing import Any
 
 from .config import Settings
 from .interactions import InteractionStore
-from .models import Classification, GoodsItem, ImprovementRecord, IssueRecurrenceAnalysis, StudyItem, SystemIssueRecord, TaskItem
+from .models import (
+    Classification,
+    GoodsItem,
+    ImprovementRecord,
+    ImprovementSummary,
+    IssueRecurrenceAnalysis,
+    StudyItem,
+    SystemIssueRecord,
+    TaskItem,
+    TechnicalChangeProposal,
+)
 from .notion_client import NotionClient
 from .openai_client import OpenAIClient, _extract_due_date, _normalize_area
 from .pending import PendingStore
 from .recent import RecentStore
+from .repository_context import RepositoryContextProvider
 from .telegram import TelegramClient
 from .todoist_client import TodoistClient
 from .task_sync import TaskSyncService
@@ -65,6 +76,7 @@ class ConductorService:
         self.pending = PendingStore(settings.pending_store_path)
         self.recent = RecentStore(settings.recent_store_path)
         self.interactions = InteractionStore(settings.interaction_store_path)
+        self.repository_context = RepositoryContextProvider()
 
     def process_text(
         self,
@@ -80,6 +92,8 @@ class ConductorService:
             feedback = self.interactions.get_feedback(chat_id)
             if feedback:
                 return self._handle_feedback_followup(text, chat_id=chat_id, source=source, feedback=feedback)
+            if _looks_like_technical_spec_request(text):
+                return self._handle_technical_spec_request(text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
             reply_interaction = self.interactions.find_by_reply(chat_id, reply_to_message_id)
             latest_interaction = self.interactions.latest_for_chat(chat_id)
             if reply_interaction and _looks_like_feedback(text, has_context=True, is_reply=True):
@@ -391,6 +405,45 @@ class ConductorService:
         feedback: dict[str, Any],
     ) -> dict[str, Any]:
         state = feedback.get("state")
+        if state == "awaiting_technical_spec_full_view":
+            if _looks_like_show_full_spec(text):
+                self.interactions.update_feedback(
+                    chat_id,
+                    {
+                        **feedback,
+                        "state": "awaiting_technical_spec_save_confirmation",
+                    },
+                )
+                print(f"TECH_SPEC_SHOWN improvement_id={feedback.get('improvement_page_id')}", flush=True)
+                self._send_message(chat_id, _format_full_technical_spec(str(feedback.get("markdown") or "")))
+                self._send_message(chat_id, "Сохранить это ТЗ в Improvement?\nДа\nНет")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec shown"]}
+            if _looks_like_improvement_no(text):
+                self.interactions.pop_feedback(chat_id)
+                self._send_message(chat_id, "Хорошо, полное ТЗ не показываю.")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec full declined"]}
+            self.interactions.update_feedback(chat_id, feedback)
+            self._send_message(chat_id, "Показать полное ТЗ? Да или Нет.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec full unclear"]}
+        if state == "awaiting_technical_spec_save_confirmation":
+            self.interactions.pop_feedback(chat_id)
+            if _looks_like_save_spec_yes(text):
+                print(f"TECH_SPEC_SAVE_REQUESTED improvement_id={feedback.get('improvement_page_id')}", flush=True)
+                try:
+                    self.notion.save_improvement_technical_spec(
+                        str(feedback.get("improvement_page_id") or feedback.get("improvement_url") or ""),
+                        str(feedback.get("markdown") or ""),
+                        today=date.today().isoformat(),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"TECH_SPEC_SAVE_ERROR improvement_id={feedback.get('improvement_page_id')}: {exc}", flush=True)
+                    self._send_message(chat_id, f"Не смогла сохранить ТЗ в Improvement: {_safe_error(exc)}")
+                    return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["technical spec save failed"]}
+                print(f"TECH_SPEC_SAVED improvement_id={feedback.get('improvement_page_id')}", flush=True)
+                self._send_message(chat_id, "Сохранила ТЗ в Improvement. Статус Improvement не меняла.")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec saved"]}
+            self._send_message(chat_id, "Хорошо, ТЗ в Improvement не сохраняю.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec save declined"]}
         if state in {"awaiting_correction_confirmation", "awaiting_fix_confirmation"}:
             self.interactions.pop_feedback(chat_id)
             if _looks_like_yes(text):
@@ -567,7 +620,15 @@ class ConductorService:
             self._send_message(chat_id, f"Не смогла создать Improvement: {_safe_error(exc)}")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["improvement create failed"]}
         print(f"IMPROVEMENT_CREATED improvement_id={_safe_notion_page_id(url)}", flush=True)
-        self._send_message(chat_id, f"Improvement создан:\n{url}")
+        message = self._send_message(chat_id, f"Improvement создан:\n{url}")
+        self.interactions.remember_improvement(
+            chat_id,
+            {
+                "improvement_url": url,
+                "improvement_page_id": _safe_notion_page_id(url),
+                "bot_message_ids": [_extract_telegram_message_id(message)] if _extract_telegram_message_id(message) is not None else [],
+            },
+        )
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["improvement created"], "improvement_url": url}
 
     def _link_existing_improvement(self, chat_id: int, feedback: dict[str, Any]) -> dict[str, Any]:
@@ -585,6 +646,75 @@ class ConductorService:
         print(f"IMPROVEMENT_LINKED_EXISTING improvement_id={existing.get('page_id') or ''}", flush=True)
         self._send_message(chat_id, "Связала ошибку с существующим Improvement.")
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["improvement linked"]}
+
+    def _handle_technical_spec_request(
+        self,
+        text: str,
+        *,
+        chat_id: int,
+        reply_to_message_id: int | None,
+    ) -> dict[str, Any]:
+        print("TECH_SPEC_REQUESTED state=request", flush=True)
+        if not _technical_spec_generation_enabled(getattr(self, "settings", None)):
+            self._send_message(chat_id, "Подготовка технического задания сейчас выключена.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec disabled"]}
+        improvement_ref = ""
+        if not improvement_ref:
+            remembered = self.interactions.find_improvement_by_reply(chat_id, reply_to_message_id)
+            improvement_ref = str((remembered or {}).get("improvement_url") or (remembered or {}).get("improvement_page_id") or "")
+        if not improvement_ref:
+            remembered = self.interactions.latest_improvement(chat_id)
+            improvement_ref = str((remembered or {}).get("improvement_url") or (remembered or {}).get("improvement_page_id") or "")
+        if not improvement_ref:
+            improvement_ref = _extract_notion_url(text) or ""
+        if not improvement_ref:
+            self._send_message(chat_id, _technical_spec_no_context_message())
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec context missing"]}
+        try:
+            improvement = self.notion.get_improvement(improvement_ref)
+            issues = self.notion.get_system_issues_by_references(improvement.related_issue_urls)
+            candidate_files = self.repository_context.find_relevant_files(improvement=improvement, issues=issues)
+            repository_context = self.repository_context.read_candidate_files(candidate_files)
+            print(
+                f"TECH_SPEC_CONTEXT_COLLECTED improvement_id={improvement.page_id} related_issue_count={len(issues)} candidate_file_count={len(repository_context)}",
+                flush=True,
+            )
+            proposal = self.openai.generate_technical_change_proposal(
+                improvement=improvement,
+                issues=issues,
+                candidate_files=candidate_files,
+                repository_context=repository_context,
+            )
+            proposal.candidate_files = [path for path in proposal.candidate_files if path in repository_context]
+            validation_error = _validate_technical_proposal(proposal, repository_context)
+            if validation_error:
+                print(f"TECH_SPEC_VALIDATION_FAILED improvement_id={improvement.page_id} state={validation_error}", flush=True)
+                self._send_message(chat_id, _format_technical_spec_failure(validation_error))
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [validation_error], "notes": ["technical spec validation failed"]}
+        except RuntimeError as exc:
+            if "AI-анализ недоступен" in str(exc):
+                self._send_message(chat_id, "Не удалось автоматически подготовить техническое задание, поскольку AI-анализ недоступен.\n\nImprovement сохранен и не изменен.")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": ["AI unavailable"], "notes": ["technical spec ai unavailable"]}
+            self._send_message(chat_id, f"Не удалось подготовить техническое задание: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["technical spec failed"]}
+        except Exception as exc:  # noqa: BLE001
+            self._send_message(chat_id, f"Не удалось подготовить техническое задание: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["technical spec failed"]}
+
+        markdown = _format_codex_task_markdown(proposal, improvement, issues)
+        self.interactions.update_feedback(
+            chat_id,
+            {
+                "state": "awaiting_technical_spec_full_view",
+                "improvement_page_id": improvement.page_id,
+                "improvement_url": improvement.url,
+                "proposal": proposal.__dict__,
+                "markdown": markdown,
+            },
+        )
+        print(f"TECH_SPEC_GENERATED improvement_id={improvement.page_id} proposal_confidence={proposal.confidence}", flush=True)
+        self._send_message(chat_id, _format_technical_spec_preview(proposal))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec preview"], "proposal": proposal.__dict__}
 
     def _build_system_issue(
         self,
@@ -652,13 +782,14 @@ class ConductorService:
             if interaction_id:
                 self.interactions.append(interaction_id, "errors", f"Could not record system issue: {exc}")
 
-    def _send_message(self, chat_id: int, text: str, *, interaction_id: str | None = None) -> None:
+    def _send_message(self, chat_id: int, text: str, *, interaction_id: str | None = None) -> Any:
         result = self.telegram.send_message(chat_id, text)
         if interaction_id and hasattr(self, "interactions"):
             self.interactions.append(interaction_id, "bot_messages", text)
             message_id = _extract_telegram_message_id(result)
             if message_id is not None:
                 self.interactions.append(interaction_id, "bot_message_ids", message_id)
+        return result
 
     def _task_questions(self, item: TaskItem) -> list[str]:
         questions: list[str] = []
@@ -755,6 +886,30 @@ def _looks_like_improvement_yes(text: str) -> bool:
 
 def _looks_like_improvement_no(text: str) -> bool:
     return text.strip().casefold() in {"нет", "не надо", "пропусти", "позже", "нет, не надо"}
+
+
+def _looks_like_technical_spec_request(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    if _extract_notion_url(text) and any(marker in normalized for marker in ("тз", "техничес", "кодекс", "codex")):
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "подготовь задачу для кодекса",
+            "сформируй тз",
+            "что нужно изменить для этого improvement",
+            "подготовь техническое решение",
+            "дай задачу разработчику",
+        )
+    )
+
+
+def _looks_like_show_full_spec(text: str) -> bool:
+    return text.strip().casefold() in {"да", "покажи", "покажи полностью", "yes", "y"}
+
+
+def _looks_like_save_spec_yes(text: str) -> bool:
+    return text.strip().casefold() in {"да", "сохрани", "сохрани в improvement", "yes", "y"}
 
 
 def _wants_systemic_improvement(text: str) -> bool:
@@ -862,6 +1017,94 @@ def _format_existing_improvement_offer(existing: dict[str, Any]) -> str:
     )
 
 
+def _technical_spec_no_context_message() -> str:
+    return (
+        "Не удалось определить Improvement.\n\n"
+        "Пришли ссылку на запись Improvement в Notion\n"
+        "или ответь Reply на сообщение о его создании."
+    )
+
+
+def _format_technical_spec_failure(reason: str) -> str:
+    return f"Не удалось подготовить надежное техническое задание.\n\nПричина:\n{reason}\n\nImprovement и связанные ошибки не изменены."
+
+
+def _format_technical_spec_preview(proposal: TechnicalChangeProposal) -> str:
+    files = "\n".join(f"- {path}" for path in proposal.candidate_files[:8]) or "- Не определены"
+    changes = "\n".join(f"- {item}" for item in proposal.required_changes[:4]) or "- Не определены"
+    return (
+        "Подготовила проект технического задания.\n\n"
+        f"Проблема:\n{proposal.problem_statement}\n\n"
+        f"Предлагаемые файлы:\n{files}\n\n"
+        f"Основные изменения:\n{changes}\n\n"
+        f"Regression-тесты: {len(proposal.regression_tests)}\n\n"
+        "Показать полное ТЗ?"
+    )
+
+
+def _format_full_technical_spec(markdown: str) -> str:
+    return "```markdown\n" + markdown.strip() + "\n```"
+
+
+def _format_codex_task_markdown(
+    proposal: TechnicalChangeProposal,
+    improvement: ImprovementSummary,
+    issues: list[Any],
+) -> str:
+    issue_lines = "\n".join(
+        f"- {issue.title} | {issue.issue_type} | {issue.database} | {issue.detected_date or 'дата не указана'}"
+        for issue in issues
+    ) or "- Связанные System Issues не найдены"
+    return "\n".join(
+        [
+            "# Задача Codex",
+            "",
+            "## Контекст",
+            f"Improvement: {improvement.title}",
+            f"Статус Improvement: {improvement.status or 'Не указан'}",
+            f"Тип улучшения: {improvement.improvement_type or proposal.change_type}",
+            "",
+            "## Проблема",
+            proposal.problem_statement,
+            "",
+            "## Подтверждающие System Issues",
+            issue_lines,
+            "",
+            "## Текущее поведение",
+            proposal.current_behavior,
+            "",
+            "## Ожидаемое поведение",
+            proposal.desired_behavior,
+            "",
+            "## Затрагиваемые файлы",
+            "\n".join(f"- {path}" for path in proposal.candidate_files),
+            "",
+            "## Требуемые изменения",
+            "\n".join(f"- {item}" for item in proposal.required_changes),
+            "",
+            "## Regression tests",
+            "\n".join(f"- {item}" for item in proposal.regression_tests),
+            "",
+            "## Acceptance criteria",
+            "\n".join(f"- {item}" for item in proposal.acceptance_criteria),
+            "",
+            "## Ограничения",
+            "\n".join(f"- {item}" for item in proposal.out_of_scope),
+            "",
+            "## Проверки",
+            "- python3 -m unittest discover -s tests -v",
+            "- python3 -m py_compile conductor/*.py",
+            "- git diff --check",
+            "",
+            "## Итоговый отчет",
+            "- что изменено",
+            "- какие regression tests добавлены",
+            "- результаты проверок",
+            "- известные ограничения",
+        ]
+    )
+
+
 def _classification_payload(classification: Classification) -> dict[str, Any]:
     return {
         "tasks": [item.__dict__ for item in classification.tasks],
@@ -927,6 +1170,37 @@ def _safe_notion_page_id(value: str) -> str:
 
 def _system_improvements_enabled(settings: Any) -> bool:
     return getattr(settings, "system_improvements_enabled", False) is True
+
+
+def _technical_spec_generation_enabled(settings: Any) -> bool:
+    return getattr(settings, "technical_spec_generation_enabled", False) is True
+
+
+def _extract_notion_url(text: str) -> str | None:
+    match = re.search(r"https?://(?:www\.)?(?:app\.)?notion\.(?:so|site)/\S+", text)
+    return match.group(0).rstrip(".,)") if match else None
+
+
+def _validate_technical_proposal(proposal: TechnicalChangeProposal, repository_context: dict[str, str]) -> str | None:
+    if not proposal.problem_statement:
+        return "нет problem_statement"
+    if not proposal.desired_behavior:
+        return "нет desired_behavior"
+    if not proposal.candidate_files:
+        return "нет существующих candidate files"
+    if any(path not in repository_context for path in proposal.candidate_files):
+        return "candidate_files содержат несуществующие или непрочитанные пути"
+    if len(proposal.regression_tests) < 2:
+        return "нужно минимум два regression test"
+    if not proposal.acceptance_criteria:
+        return "нет acceptance criteria"
+    forbidden = (".env", "data/", "interactions.json", "pending.json", "recent.json")
+    if any(any(marker in path for marker in forbidden) for path in proposal.candidate_files):
+        return "candidate_files содержат секретные или runtime-файлы"
+    combined = " ".join(proposal.required_changes + proposal.acceptance_criteria).casefold()
+    if any(marker in combined for marker in ("весь репозитор", "создай pr", "создать pr", "commit", "branch")):
+        return "ТЗ содержит запрещенный scope"
+    return None
 
 
 def _edit_guidance_message() -> str:

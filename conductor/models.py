@@ -219,6 +219,26 @@ class IssueRecurrenceAnalysis:
     priority: str
 
 
+@dataclass
+class TechnicalChangeProposal:
+    improvement_title: str
+    problem_statement: str
+    evidence_summary: str
+    desired_behavior: str
+    current_behavior: str
+    likely_root_cause: str
+    change_type: str
+    affected_components: list[str]
+    candidate_files: list[str]
+    required_changes: list[str]
+    regression_tests: list[str]
+    acceptance_criteria: list[str]
+    out_of_scope: list[str]
+    risks: list[str]
+    open_questions: list[str]
+    confidence: float
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -367,4 +387,25 @@ def issue_recurrence_analysis_from_dict(data: dict[str, Any]) -> IssueRecurrence
         improvement_type=improvement_type if improvement_type in IMPROVEMENT_TYPES else "Правило",
         change_location=change_location if change_location in IMPROVEMENT_CHANGE_LOCATIONS else "Правила Дирижёра",
         priority=priority if priority in IMPROVEMENT_PRIORITIES else "Средний",
+    )
+
+
+def technical_change_proposal_from_dict(data: dict[str, Any]) -> TechnicalChangeProposal:
+    return TechnicalChangeProposal(
+        improvement_title=str(data.get("improvement_title") or "").strip(),
+        problem_statement=str(data.get("problem_statement") or "").strip(),
+        evidence_summary=str(data.get("evidence_summary") or "").strip(),
+        desired_behavior=str(data.get("desired_behavior") or "").strip(),
+        current_behavior=str(data.get("current_behavior") or "").strip(),
+        likely_root_cause=str(data.get("likely_root_cause") or "").strip(),
+        change_type=str(data.get("change_type") or "").strip(),
+        affected_components=[str(value) for value in data.get("affected_components", []) if str(value).strip()],
+        candidate_files=[str(value) for value in data.get("candidate_files", []) if str(value).strip()],
+        required_changes=[str(value) for value in data.get("required_changes", []) if str(value).strip()],
+        regression_tests=[str(value) for value in data.get("regression_tests", []) if str(value).strip()],
+        acceptance_criteria=[str(value) for value in data.get("acceptance_criteria", []) if str(value).strip()],
+        out_of_scope=[str(value) for value in data.get("out_of_scope", []) if str(value).strip()],
+        risks=[str(value) for value in data.get("risks", []) if str(value).strip()],
+        open_questions=[str(value) for value in data.get("open_questions", []) if str(value).strip()],
+        confidence=max(0.0, min(_as_float(data.get("confidence"), 0.0), 1.0)),
     )

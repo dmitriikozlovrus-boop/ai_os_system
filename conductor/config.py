@@ -41,6 +41,7 @@ class Settings:
     notion_system_issues_database_id: str
     notion_improvements_database_id: str
     system_improvements_enabled: bool
+    technical_spec_generation_enabled: bool
     notion_projects_database_id: str
     notion_streams_database_id: str
     host: str
@@ -86,6 +87,7 @@ def get_settings() -> Settings:
         notion_system_issues_database_id=os.getenv("NOTION_SYSTEM_ISSUES_DATABASE_ID", ""),
         notion_improvements_database_id=os.getenv("NOTION_IMPROVEMENTS_DATABASE_ID", ""),
         system_improvements_enabled=_bool("SYSTEM_IMPROVEMENTS_ENABLED", False),
+        technical_spec_generation_enabled=_bool("TECHNICAL_SPEC_GENERATION_ENABLED", False),
         notion_projects_database_id=os.getenv("NOTION_PROJECTS_DATABASE_ID", ""),
         notion_streams_database_id=os.getenv("NOTION_STREAMS_DATABASE_ID", ""),
         host=os.getenv("HOST", "0.0.0.0"),

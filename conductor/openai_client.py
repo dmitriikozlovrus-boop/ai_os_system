@@ -24,11 +24,14 @@ from .models import (
     SYSTEM_ISSUE_TYPES,
     Classification,
     IssueRecurrenceAnalysis,
+    ImprovementSummary,
     SystemIssueRecord,
     SystemIssueSummary,
+    TechnicalChangeProposal,
     classification_from_dict,
     issue_recurrence_analysis_from_dict,
     system_issue_classification_from_dict,
+    technical_change_proposal_from_dict,
 )
 
 
@@ -241,6 +244,48 @@ ISSUE_RECURRENCE_SCHEMA: dict[str, Any] = {
         "improvement_type",
         "change_location",
         "priority",
+    ],
+}
+
+
+TECHNICAL_CHANGE_PROPOSAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "improvement_title": {"type": "string"},
+        "problem_statement": {"type": "string"},
+        "evidence_summary": {"type": "string"},
+        "desired_behavior": {"type": "string"},
+        "current_behavior": {"type": "string"},
+        "likely_root_cause": {"type": "string"},
+        "change_type": {"type": "string"},
+        "affected_components": {"type": "array", "items": {"type": "string"}},
+        "candidate_files": {"type": "array", "items": {"type": "string"}},
+        "required_changes": {"type": "array", "items": {"type": "string"}},
+        "regression_tests": {"type": "array", "items": {"type": "string"}},
+        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+        "out_of_scope": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": [
+        "improvement_title",
+        "problem_statement",
+        "evidence_summary",
+        "desired_behavior",
+        "current_behavior",
+        "likely_root_cause",
+        "change_type",
+        "affected_components",
+        "candidate_files",
+        "required_changes",
+        "regression_tests",
+        "acceptance_criteria",
+        "out_of_scope",
+        "risks",
+        "open_questions",
+        "confidence",
     ],
 }
 
@@ -466,6 +511,58 @@ class OpenAIClient:
             return analysis
         except Exception:
             return _fallback_issue_recurrence(issue, issue_url, candidates, force_improvement=force_improvement)
+
+    def generate_technical_change_proposal(
+        self,
+        *,
+        improvement: ImprovementSummary,
+        issues: list[SystemIssueSummary],
+        candidate_files: list[str],
+        repository_context: dict[str, str],
+    ) -> TechnicalChangeProposal:
+        if not self.api_key:
+            raise RuntimeError("AI-анализ недоступен")
+        system = (
+            "Ты готовишь ограниченное техническое задание для Codex по подтвержденному Improvement. "
+            "Не предлагай запуск Codex, создание branch, commit или PR. "
+            "Candidate files должны быть только из переданного списка. "
+            "Формулируй предполагаемую причину как гипотезу, а не установленный факт. "
+            "Добавь положительные и отрицательные regression tests."
+        )
+        payload = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "improvement": improvement.__dict__,
+                            "system_issues": [issue.__dict__ for issue in issues],
+                            "candidate_files": candidate_files,
+                            "repository_context": repository_context,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "conductor_technical_change_proposal",
+                    "schema": TECHNICAL_CHANGE_PROPOSAL_SCHEMA,
+                    "strict": True,
+                }
+            },
+        }
+        data = request_json(
+            "POST",
+            "https://api.openai.com/v1/responses",
+            headers={**self.headers, "Content-Type": "application/json"},
+            payload=payload,
+            timeout=90,
+        )
+        return technical_change_proposal_from_dict(json.loads(_extract_response_text(data)))
 
     def _transcription_models(self) -> list[str]:
         models = [self.transcribe_model]

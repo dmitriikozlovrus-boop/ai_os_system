@@ -233,6 +233,54 @@ class NotionClient:
             payload={"properties": {"Какие ошибки исправляет": {"relation": relation}}},
         )
 
+    def get_improvement(self, improvement_ref: str) -> ImprovementSummary:
+        page_id = notion_page_id_from_reference(improvement_ref)
+        data = request_json("GET", f"https://api.notion.com/v1/pages/{page_id}", headers=self.headers)
+        return _improvement_summary(data)
+
+    def get_system_issues_by_references(self, issue_refs: list[str], *, limit: int = 10) -> list[SystemIssueSummary]:
+        issues = []
+        for reference in issue_refs[:limit]:
+            page_id = notion_page_id_from_reference(reference)
+            data = request_json("GET", f"https://api.notion.com/v1/pages/{page_id}", headers=self.headers)
+            issues.append(_system_issue_summary(data))
+        return issues
+
+    def save_improvement_technical_spec(self, improvement_ref: str, markdown: str, *, today: str) -> None:
+        page_id = notion_page_id_from_reference(improvement_ref)
+        self._archive_existing_technical_spec(page_id)
+        payload = {
+            "children": _technical_spec_blocks(markdown, today=today),
+        }
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=self.headers,
+            payload=payload,
+        )
+
+    def _archive_existing_technical_spec(self, page_id: str) -> None:
+        data = request_json(
+            "GET",
+            f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100",
+            headers=self.headers,
+        )
+        blocks = data.get("results", []) or []
+        deleting = False
+        for block in blocks:
+            block_id = block.get("id")
+            if _block_plain_text(block).strip() == "Техническое задание для Codex":
+                deleting = True
+            if deleting and block_id:
+                request_json(
+                    "PATCH",
+                    f"https://api.notion.com/v1/blocks/{block_id}",
+                    headers=self.headers,
+                    payload={"archived": True},
+                )
+            if deleting and "CONDUCTOR_TECH_SPEC_END" in _block_plain_text(block):
+                break
+
     def update_task(
         self,
         page_id: str,
@@ -418,6 +466,44 @@ def _improvement_summary(row: dict[str, Any]) -> ImprovementSummary:
         change_location=_select(props.get("Где изменить")),
         related_issue_urls=[item.get("id", "") for item in relation if item.get("id")],
     )
+
+
+def _technical_spec_blocks(markdown: str, *, today: str) -> list[dict[str, Any]]:
+    blocks = [
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Техническое задание для Codex"}}]},
+        },
+        _paragraph_block("Статус проекта ТЗ: Черновик"),
+        _paragraph_block(f"Дата формирования: {today}"),
+    ]
+    for chunk in _chunks(markdown, 1800):
+        blocks.append(_paragraph_block(chunk))
+    blocks.append(_paragraph_block("<!-- CONDUCTOR_TECH_SPEC_END -->"))
+    return blocks
+
+
+def _paragraph_block(text: str) -> dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": [{"type": "text", "text": {"content": text[:2000]}}]},
+    }
+
+
+def _chunks(text: str, size: int) -> list[str]:
+    if not text:
+        return []
+    return [text[index : index + size] for index in range(0, len(text), size)]
+
+
+def _block_plain_text(block: dict[str, Any]) -> str:
+    block_type = block.get("type")
+    if not block_type:
+        return ""
+    rich_text = (block.get(block_type) or {}).get("rich_text", [])
+    return "".join(part.get("plain_text", "") for part in rich_text)
 
 
 def _issue_title(classification: Any) -> str:

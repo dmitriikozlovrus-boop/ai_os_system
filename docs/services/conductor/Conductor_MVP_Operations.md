@@ -51,6 +51,7 @@ conductor/
 - создание записей в Notion `Study / На изучение`;
 - создание записей в Notion `GOODS`;
 - локальное хранение ожидающих уточнений в `data/pending.json`;
+- формирование черновика технического задания из `IMPROVEMENTS` при отдельном feature flag;
 - полную двустороннюю синхронизацию базы `TASKS` и Todoist.
 
 ## Быстрый старт
@@ -117,6 +118,33 @@ python3 -m conductor.cli "Завтра напомни написать Марк�
 - исходный `RAW` отдельно не сохраняется;
 - Todoist включается при наличии `TODOIST_API_TOKEN`;
 - аварийная пауза Todoist sync управляется только переменной `TODOIST_SYNC_PAUSED`.
+- генерация технического задания из Improvement выключена по умолчанию и управляется `TECHNICAL_SPEC_GENERATION_ENABLED`.
+
+## Improvement → Codex Task
+
+Сценарий подготовки технического задания описан отдельно:
+
+```text
+docs/product/use_cases/UC_004_Improvement_To_Codex_Task.md
+```
+
+Операционные правила:
+
+- `TECHNICAL_SPEC_GENERATION_ENABLED=false` — значение по умолчанию;
+- Conductor не запускает Codex, не создает GitHub issue, branch, commit или PR;
+- Improvement context выбирается из текущего Telegram chat, reply на сообщение о созданном Improvement или явной Notion URL;
+- связанные ошибки читаются через relation `IMPROVEMENTS.Какие ошибки исправляет`;
+- локальный repository context read-only и ограничен 8 файлами, 120 KB и 300 строками на файл;
+- preview не сохраняется в Notion;
+- полное ТЗ показывается после подтверждения пользователя;
+- сохранение в Improvement выполняется только после отдельного подтверждения пользователя;
+- при отсутствии OpenAI Improvement не изменяется.
+
+Feature flag:
+
+```bash
+TECHNICAL_SPEC_GENERATION_ENABLED=false
+```
 
 ## TASKS ↔ Todoist
 

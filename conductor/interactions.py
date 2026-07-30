@@ -135,6 +135,34 @@ class InteractionStore:
         self._save(data)
         return payload
 
+    def remember_improvement(self, chat_id: int, improvement: dict[str, Any]) -> None:
+        data = self._load()
+        payload = dict(improvement)
+        payload["timestamp"] = _now()
+        values = data.setdefault("_improvements", {}).setdefault(str(chat_id), [])
+        if isinstance(values, dict):
+            values = [values]
+            data["_improvements"][str(chat_id)] = values
+        values.append(payload)
+        self._save(data)
+
+    def latest_improvement(self, chat_id: int) -> dict[str, Any] | None:
+        values = self._improvements_for_chat(chat_id)
+        return max(values, key=lambda item: item.get("timestamp", "")) if values else None
+
+    def find_improvement_by_reply(self, chat_id: int, reply_to_message_id: int | None) -> dict[str, Any] | None:
+        if reply_to_message_id is None:
+            return None
+        for item in self._improvements_for_chat(chat_id):
+            if reply_to_message_id in item.get("bot_message_ids", []):
+                return item
+        return None
+
+    def _improvements_for_chat(self, chat_id: int) -> list[dict[str, Any]]:
+        raw = self._load().get("_improvements", {}).get(str(chat_id), [])
+        values = [raw] if isinstance(raw, dict) else raw
+        return [item for item in values if isinstance(item, dict) and not _expired(item.get("timestamp"), FEEDBACK_TTL)]
+
     def has_issue_fingerprint(self, fingerprint: str) -> bool:
         data = self._load()
         self._prune_fingerprints(data)
