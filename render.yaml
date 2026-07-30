@@ -54,6 +54,8 @@ services:
         value: /var/data/todoist_sync_state.json
       - key: TODOIST_COMPLETED_SINCE
         value: 2007-01-01
+      - key: SYSTEM_IMPROVEMENTS_ENABLED
+        value: false
       - key: NOTION_TASKS_DATABASE_ID
         value: be9d26fe652b474696cd5de0118b1210
       - key: NOTION_STUDY_DATABASE_ID
@@ -62,6 +64,8 @@ services:
         value: e327cd54181f44ba883bb5a012dfd3d7
       - key: NOTION_SYSTEM_ISSUES_DATABASE_ID
         value: 268ecbc58ba44b1787de101e49af1c73
+      - key: NOTION_IMPROVEMENTS_DATABASE_ID
+        value: 59332d8093464758baa4a86e077cbe59
       - key: NOTION_PROJECTS_DATABASE_ID
         value: bbb501a6933941b4837afff250479f0e
       - key: NOTION_STREAMS_DATABASE_ID

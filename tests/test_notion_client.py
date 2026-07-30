@@ -1,8 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from conductor.models import SystemIssueClassification, SystemIssueRecord
-from conductor.notion_client import NotionClient, _system_issue_properties
+from conductor.models import ImprovementRecord, SystemIssueClassification, SystemIssueRecord
+from conductor.notion_client import NotionClient, _improvement_properties, _system_issue_properties, notion_page_id_from_reference
 
 
 class NotionClientSystemIssueTest(unittest.TestCase):
@@ -47,6 +47,168 @@ class NotionClientSystemIssueTest(unittest.TestCase):
         properties = _system_issue_properties(self._issue())
         self.assertIn("Исходный ввод", properties["Входные данные"]["rich_text"][0]["text"]["content"])
         self.assertEqual(properties["Тип ошибки"], {"select": {"name": "Неверное извлечение поля"}})
+
+    def test_list_recent_system_issues_uses_date_filters_and_limit(self):
+        client = NotionClient("token", "tasks", "study", "projects", system_issues_db="issues")
+        with patch("conductor.notion_client.request_json", return_value={"results": []}) as request_json:
+            self.assertEqual(
+                client.list_recent_system_issues(issue_type="Неверная классификация", database="BUY", days=90, limit=30),
+                [],
+            )
+        payload = request_json.call_args.kwargs["payload"]
+        self.assertEqual(payload["page_size"], 30)
+        self.assertEqual(
+            payload["filter"]["and"][1],
+            {"property": "Тип ошибки", "select": {"equals": "Неверная классификация"}},
+        )
+        self.assertEqual(payload["filter"]["and"][2], {"property": "База данных", "select": {"equals": "BUY"}})
+
+    def test_create_improvement_uses_existing_properties_and_relations(self):
+        client = NotionClient("token", "tasks", "study", "projects", improvements_db="59332d8093464758baa4a86e077cbe59")
+        improvement = ImprovementRecord(
+            title="Уточнить классификацию товаров",
+            description="Похожие ошибки Goods и Study.",
+            suggested_change="Добавить правило и regression-тесты.",
+            improvement_type="Правило",
+            change_location="Правила Дирижёра",
+            priority="Средний",
+        )
+        with patch("conductor.notion_client.request_json", return_value={"url": "improvement-url"}) as request_json:
+            self.assertEqual(
+                client.create_improvement(
+                    improvement,
+                    related_issue_urls=[
+                        "https://www.notion.so/new-12345678123412341234123456789012",
+                        "https://www.notion.so/a-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ],
+                ),
+                "improvement-url",
+            )
+        payload = request_json.call_args.kwargs["payload"]
+        self.assertEqual(payload["parent"], {"database_id": "59332d8093464758baa4a86e077cbe59"})
+        self.assertEqual(payload["properties"]["Статус"], {"select": {"name": "Идея"}})
+        self.assertEqual(len(payload["properties"]["Какие ошибки исправляет"]["relation"]), 2)
+
+    def test_improvement_properties_use_exact_notion_field_names(self):
+        properties = _improvement_properties(
+            ImprovementRecord(
+                title="Уточнить правило",
+                description="Описание",
+                suggested_change="Что изменить",
+                improvement_type="Правило",
+                change_location="Правила Дирижёра",
+                priority="Высокий",
+            ),
+            related_issue_urls=[],
+        )
+
+        self.assertEqual(properties["Какие ошибки исправляет"], {"relation": []})
+        self.assertEqual(
+            set(properties),
+            {
+                "Улучшение",
+                "Описание",
+                "Что изменить",
+                "Тип улучшения",
+                "Где изменить",
+                "Приоритет",
+                "Статус",
+                "Какие ошибки исправляет",
+            },
+        )
+
+    def test_find_open_improvements_uses_open_statuses_and_relation_filter(self):
+        client = NotionClient("token", "tasks", "study", "projects", improvements_db="improvements")
+        with patch("conductor.notion_client.request_json", return_value={"results": []}) as request_json:
+            client.find_open_improvements_for_issues(
+                related_issue_urls=["https://www.notion.so/new-12345678123412341234123456789012"],
+                title="Уточнить классификацию товаров",
+                improvement_type="Правило",
+                change_location="Правила Дирижёра",
+            )
+        filters = request_json.call_args.kwargs["payload"]["filter"]["and"]
+        statuses = {item["select"]["equals"] for item in filters[0]["or"]}
+        self.assertEqual(statuses, {"Идея", "В работе", "Отложено"})
+        self.assertEqual(filters[1]["or"][0]["property"], "Какие ошибки исправляет")
+
+    def test_notion_page_reference_accepts_uuid_without_dashes(self):
+        self.assertEqual(
+            notion_page_id_from_reference("12345678123412341234123456789012"),
+            "12345678-1234-1234-1234-123456789012",
+        )
+
+    def test_notion_page_reference_accepts_uuid_with_dashes(self):
+        self.assertEqual(
+            notion_page_id_from_reference("12345678-1234-1234-1234-123456789012"),
+            "12345678-1234-1234-1234-123456789012",
+        )
+
+    def test_notion_page_reference_accepts_notion_url_and_app_url(self):
+        self.assertEqual(
+            notion_page_id_from_reference("https://www.notion.so/Test-12345678123412341234123456789012?pvs=4"),
+            "12345678-1234-1234-1234-123456789012",
+        )
+        self.assertEqual(
+            notion_page_id_from_reference("https://app.notion.com/workspace/Test-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )
+
+    def test_invalid_notion_page_reference_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Invalid Notion page reference"):
+            notion_page_id_from_reference("https://www.notion.so/not-a-page")
+
+    def test_database_id_is_rejected_as_relation_page_id(self):
+        client = NotionClient(
+            "token",
+            "tasks",
+            "study",
+            "projects",
+            system_issues_db="268ecbc58ba44b1787de101e49af1c73",
+            improvements_db="59332d8093464758baa4a86e077cbe59",
+        )
+        with self.assertRaisesRegex(ValueError, "database ID"):
+            client.create_improvement(
+                ImprovementRecord(
+                    title="Уточнить правило",
+                    description="Описание",
+                    suggested_change="Что изменить",
+                    improvement_type="Правило",
+                    change_location="Правила Дирижёра",
+                    priority="Средний",
+                ),
+                related_issue_urls=["268ecbc58ba44b1787de101e49af1c73"],
+            )
+
+    def test_unknown_improvement_select_value_is_rejected_before_request(self):
+        client = NotionClient("token", "tasks", "study", "projects", improvements_db="improvements")
+        with self.assertRaisesRegex(ValueError, "Unknown Improvement type"):
+            client.create_improvement(
+                ImprovementRecord(
+                    title="Уточнить правило",
+                    description="Описание",
+                    suggested_change="Что изменить",
+                    improvement_type="GitHub",
+                    change_location="Правила Дирижёра",
+                    priority="Средний",
+                ),
+                related_issue_urls=[],
+            )
+
+    def test_create_improvement_always_uses_idea_status(self):
+        properties = _improvement_properties(
+            ImprovementRecord(
+                title="Уточнить правило",
+                description="Описание",
+                suggested_change="Что изменить",
+                improvement_type="Правило",
+                change_location="Правила Дирижёра",
+                priority="Средний",
+                status="В работе",
+            ),
+            related_issue_urls=[],
+        )
+
+        self.assertEqual(properties["Статус"], {"select": {"name": "Идея"}})
 
 
 if __name__ == "__main__":

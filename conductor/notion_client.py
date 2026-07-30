@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import re
+from datetime import date, timedelta
 from typing import Any
 
 from .http import request_json
-from .models import GoodsItem, StudyItem, SystemIssueRecord, TaskItem
+from .models import (
+    IMPROVEMENT_CHANGE_LOCATIONS,
+    IMPROVEMENT_OPEN_STATUSES,
+    IMPROVEMENT_PRIORITIES,
+    IMPROVEMENT_TYPES,
+    GoodsItem,
+    ImprovementRecord,
+    ImprovementSummary,
+    StudyItem,
+    SystemIssueRecord,
+    SystemIssueSummary,
+    TaskItem,
+)
 
 
 NOTION_VERSION = "2022-06-28"
@@ -18,6 +32,7 @@ class NotionClient:
         projects_db: str,
         goods_db: str = "",
         system_issues_db: str = "",
+        improvements_db: str = "",
     ):
         self.token = token
         self.tasks_db = tasks_db
@@ -25,6 +40,7 @@ class NotionClient:
         self.projects_db = projects_db
         self.goods_db = goods_db
         self.system_issues_db = system_issues_db
+        self.improvements_db = improvements_db
 
     @property
     def headers(self) -> dict[str, str]:
@@ -111,6 +127,110 @@ class NotionClient:
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=self.headers,
             payload={"properties": properties},
+        )
+
+    def list_recent_system_issues(
+        self,
+        *,
+        issue_type: str | None = None,
+        database: str | None = None,
+        days: int = 90,
+        limit: int = 30,
+    ) -> list[SystemIssueSummary]:
+        if not self.token or not self.system_issues_db:
+            return []
+        filters: list[dict[str, Any]] = [
+            {
+                "property": "Дата обнаружения",
+                "date": {"on_or_after": (date.today() - timedelta(days=days)).isoformat()},
+            }
+        ]
+        if issue_type:
+            filters.append({"property": "Тип ошибки", "select": {"equals": issue_type}})
+        if database:
+            filters.append({"property": "База данных", "select": {"equals": database}})
+        payload: dict[str, Any] = {
+            "page_size": max(1, min(limit, 100)),
+            "sorts": [{"property": "Дата обнаружения", "direction": "descending"}],
+            "filter": {"and": filters},
+        }
+        data = request_json(
+            "POST",
+            f"https://api.notion.com/v1/databases/{self.system_issues_db}/query",
+            headers=self.headers,
+            payload=payload,
+        )
+        return [_system_issue_summary(row) for row in data.get("results", [])]
+
+    def find_open_improvements_for_issues(
+        self,
+        *,
+        related_issue_urls: list[str],
+        title: str = "",
+        improvement_type: str = "",
+        change_location: str = "",
+        limit: int = 10,
+    ) -> list[ImprovementSummary]:
+        if not self.token or not self.improvements_db:
+            return []
+        issue_ids = []
+        for url in related_issue_urls:
+            try:
+                issue_ids.append(notion_page_id_from_reference(url))
+            except ValueError:
+                continue
+        filters: list[dict[str, Any]] = [
+            {"or": [{"property": "Статус", "select": {"equals": status}} for status in sorted(IMPROVEMENT_OPEN_STATUSES)]}
+        ]
+        if issue_ids:
+            filters.append({"or": [{"property": "Какие ошибки исправляет", "relation": {"contains": page_id}} for page_id in issue_ids]})
+        elif title:
+            filters.append({"property": "Улучшение", "title": {"equals": title[:2000]}})
+        payload: dict[str, Any] = {"page_size": max(1, min(limit, 100)), "filter": {"and": filters}}
+        data = request_json(
+            "POST",
+            f"https://api.notion.com/v1/databases/{self.improvements_db}/query",
+            headers=self.headers,
+            payload=payload,
+        )
+        summaries = [_improvement_summary(row) for row in data.get("results", [])]
+        normalized_title = _normalize_text(title)
+        if normalized_title:
+            summaries = [
+                item
+                for item in summaries
+                if item.related_issue_urls
+                or (
+                    _normalize_text(item.title) == normalized_title
+                    and item.improvement_type == improvement_type
+                    and item.change_location == change_location
+                )
+            ]
+        return summaries
+
+    def create_improvement(self, improvement: ImprovementRecord, *, related_issue_urls: list[str]) -> str:
+        if not self.improvements_db:
+            raise RuntimeError("NOTION_IMPROVEMENTS_DATABASE_ID is not configured")
+        payload = {
+            "parent": {"database_id": self.improvements_db},
+            "properties": _improvement_properties(
+                improvement,
+                related_issue_urls=related_issue_urls,
+                forbidden_relation_ids=[self.improvements_db, self.system_issues_db],
+            ),
+        }
+        data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
+        return data.get("url", "")
+
+    def add_issues_to_improvement(self, improvement_page_id: str, *, related_issue_urls: list[str]) -> None:
+        improvement_page_id = notion_page_id_from_reference(improvement_page_id)
+        issue_ids = _relation_page_ids(related_issue_urls, forbidden_ids=[self.improvements_db, self.system_issues_db])
+        relation = [{"id": page_id} for page_id in issue_ids]
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{improvement_page_id}",
+            headers=self.headers,
+            payload={"properties": {"Какие ошибки исправляет": {"relation": relation}}},
         )
 
     def update_task(
@@ -245,6 +365,61 @@ def _system_issue_properties(issue: SystemIssueRecord) -> dict[str, Any]:
     }
 
 
+def _improvement_properties(
+    improvement: ImprovementRecord,
+    *,
+    related_issue_urls: list[str],
+    forbidden_relation_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    issue_ids = _relation_page_ids(related_issue_urls, forbidden_ids=forbidden_relation_ids or [])
+    if improvement.improvement_type not in IMPROVEMENT_TYPES:
+        raise ValueError(f"Unknown Improvement type: {improvement.improvement_type}")
+    if improvement.change_location not in IMPROVEMENT_CHANGE_LOCATIONS:
+        raise ValueError(f"Unknown Improvement change location: {improvement.change_location}")
+    if improvement.priority not in IMPROVEMENT_PRIORITIES:
+        raise ValueError(f"Unknown Improvement priority: {improvement.priority}")
+    return {
+        "Улучшение": _title_prop(improvement.title),
+        "Описание": _rich_text_prop(improvement.description),
+        "Что изменить": _rich_text_prop(improvement.suggested_change),
+        "Тип улучшения": _select_prop(improvement.improvement_type),
+        "Где изменить": _select_prop(improvement.change_location),
+        "Приоритет": _select_prop(improvement.priority),
+        "Статус": _select_prop("Идея"),
+        "Какие ошибки исправляет": {"relation": [{"id": page_id} for page_id in issue_ids]},
+    }
+
+
+def _system_issue_summary(row: dict[str, Any]) -> SystemIssueSummary:
+    props = row.get("properties", {})
+    return SystemIssueSummary(
+        page_id=row.get("id", ""),
+        url=row.get("url", ""),
+        title=_title(props.get("Краткое описание ошибки")),
+        issue_type=_select(props.get("Тип ошибки")),
+        severity=_select(props.get("Критичность")),
+        database=_select(props.get("База данных")),
+        input_data=_rich_text(props.get("Входные данные")),
+        description=_rich_text(props.get("Описание")),
+        solution=_rich_text(props.get("Решение")),
+        detected_date=_date_value(props.get("Дата обнаружения")),
+    )
+
+
+def _improvement_summary(row: dict[str, Any]) -> ImprovementSummary:
+    props = row.get("properties", {})
+    relation = props.get("Какие ошибки исправляет", {}).get("relation", []) or []
+    return ImprovementSummary(
+        page_id=row.get("id", ""),
+        url=row.get("url", ""),
+        title=_title(props.get("Улучшение")),
+        status=_select(props.get("Статус")),
+        improvement_type=_select(props.get("Тип улучшения")),
+        change_location=_select(props.get("Где изменить")),
+        related_issue_urls=[item.get("id", "") for item in relation if item.get("id")],
+    )
+
+
 def _issue_title(classification: Any) -> str:
     title = classification.title or classification.expected_result or classification.actual_result or "Ошибка Дирижера"
     return f"{classification.issue_type}: {title}"[:2000]
@@ -261,6 +436,18 @@ def _select(prop: dict[str, Any] | None) -> str:
         return ""
     value = prop.get("select") or prop.get("status")
     return value.get("name", "") if value else ""
+
+
+def _rich_text(prop: dict[str, Any] | None) -> str:
+    if not prop:
+        return ""
+    return "".join(part.get("plain_text", "") for part in prop.get("rich_text", []))
+
+
+def _date_value(prop: dict[str, Any] | None) -> str:
+    if not prop or not prop.get("date"):
+        return ""
+    return str(prop["date"].get("start") or "")
 
 
 def _title_prop(value: str) -> dict[str, Any]:
@@ -289,6 +476,49 @@ def _number_prop(value: float) -> dict[str, Any]:
 
 def _url_prop(value: str) -> dict[str, Any]:
     return {"url": value}
+
+
+def notion_page_id_from_reference(value: str) -> str:
+    reference = str(value or "").strip()
+    if not reference:
+        raise ValueError("Notion page reference is empty")
+    uuid_match = re.search(
+        r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+        reference,
+    )
+    if uuid_match:
+        return uuid_match.group(1).lower()
+    compact_matches = re.findall(r"(?<![0-9a-fA-F])([0-9a-fA-F]{32})(?![0-9a-fA-F])", reference)
+    if compact_matches:
+        raw = compact_matches[-1].lower()
+        return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+    raise ValueError(f"Invalid Notion page reference: {reference[:120]}")
+
+
+def _relation_page_ids(references: list[str], *, forbidden_ids: list[str]) -> list[str]:
+    forbidden = set()
+    for value in forbidden_ids:
+        if not value:
+            continue
+        try:
+            forbidden.add(notion_page_id_from_reference(value))
+        except ValueError:
+            continue
+    result = []
+    seen = set()
+    for reference in references:
+        page_id = notion_page_id_from_reference(reference)
+        if page_id in forbidden:
+            raise ValueError("Notion database ID cannot be used as a page relation ID")
+        if page_id in seen:
+            continue
+        seen.add(page_id)
+        result.append(page_id)
+    return result
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join(value.casefold().split())
 
 
 def _priority(value: str | None) -> str:

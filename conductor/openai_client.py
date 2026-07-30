@@ -15,12 +15,19 @@ from .models import (
     GOODS_TYPES,
     GOODS_USAGE_PLACES,
     GOODS_USERS,
+    IMPROVEMENT_CHANGE_LOCATIONS,
+    IMPROVEMENT_PRIORITIES,
+    IMPROVEMENT_TYPES,
     PROJECT_PRIORITIES,
     SYSTEM_ISSUE_DATABASES,
     SYSTEM_ISSUE_SEVERITIES,
     SYSTEM_ISSUE_TYPES,
     Classification,
+    IssueRecurrenceAnalysis,
+    SystemIssueRecord,
+    SystemIssueSummary,
     classification_from_dict,
+    issue_recurrence_analysis_from_dict,
     system_issue_classification_from_dict,
 )
 
@@ -206,6 +213,38 @@ SYSTEM_ISSUE_SCHEMA: dict[str, Any] = {
 }
 
 
+ISSUE_RECURRENCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "is_recurring": {"type": "boolean"},
+        "related_issue_urls": {"type": "array", "items": {"type": "string"}},
+        "recurrence_group_title": {"type": "string"},
+        "similarity_reason": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "suggested_improvement_title": {"type": "string"},
+        "suggested_improvement_description": {"type": "string"},
+        "suggested_change": {"type": "string"},
+        "improvement_type": {"type": "string", "enum": sorted(IMPROVEMENT_TYPES)},
+        "change_location": {"type": "string", "enum": sorted(IMPROVEMENT_CHANGE_LOCATIONS)},
+        "priority": {"type": "string", "enum": sorted(IMPROVEMENT_PRIORITIES)},
+    },
+    "required": [
+        "is_recurring",
+        "related_issue_urls",
+        "recurrence_group_title",
+        "similarity_reason",
+        "confidence",
+        "suggested_improvement_title",
+        "suggested_improvement_description",
+        "suggested_change",
+        "improvement_type",
+        "change_location",
+        "priority",
+    ],
+}
+
+
 class OpenAIClient:
     def __init__(self, api_key: str, model: str, transcribe_model: str, transcribe_fallback_model: str | None = None):
         self.api_key = api_key
@@ -367,6 +406,66 @@ class OpenAIClient:
             return system_issue_classification_from_dict(json.loads(_extract_response_text(data)))
         except Exception:
             return _fallback_system_issue_classification(original_text, actual_context, correction)
+
+    def analyze_issue_recurrence(
+        self,
+        *,
+        issue: SystemIssueRecord,
+        issue_url: str,
+        candidates: list[SystemIssueSummary],
+        force_improvement: bool = False,
+    ) -> IssueRecurrenceAnalysis:
+        if not self.api_key:
+            return _fallback_issue_recurrence(issue, issue_url, candidates, force_improvement=force_improvement)
+        system = (
+            "Ты анализируешь повторяемость системных ошибок сервиса 'Дирижер'. "
+            "Сравни новую ошибку с кандидатами. Не считай ошибки связанными только из-за одинакового типа или базы. "
+            "Связанность должна опираться на одинаковое направление исправления, похожую фактическую ошибку или одинаковый сбой маршрутизации/полей. "
+            "Если найдено достаточно повторов, предложи одно Improvement, но не создавай его."
+        )
+        payload = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "new_issue": _issue_for_recurrence(issue, issue_url),
+                            "candidates": [_candidate_for_recurrence(candidate) for candidate in candidates],
+                            "force_improvement": force_improvement,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "conductor_issue_recurrence",
+                    "schema": ISSUE_RECURRENCE_SCHEMA,
+                    "strict": True,
+                }
+            },
+        }
+        try:
+            data = request_json(
+                "POST",
+                "https://api.openai.com/v1/responses",
+                headers={**self.headers, "Content-Type": "application/json"},
+                payload=payload,
+                timeout=90,
+            )
+            analysis = issue_recurrence_analysis_from_dict(json.loads(_extract_response_text(data)))
+            previous_related = [url for url in analysis.related_issue_urls if url != issue_url]
+            recurring = len(previous_related) >= 2 or (len(previous_related) >= 1 and issue.classification.severity == "Высокая")
+            if force_improvement and (previous_related or candidates):
+                recurring = True
+            if not recurring:
+                analysis.is_recurring = False
+            return analysis
+        except Exception:
+            return _fallback_issue_recurrence(issue, issue_url, candidates, force_improvement=force_improvement)
 
     def _transcription_models(self) -> list[str]:
         models = [self.transcribe_model]
@@ -921,6 +1020,157 @@ def _fallback_system_issue_classification(original_text: str, actual_context: di
         needs_user_clarification=correction_intent == "UNKNOWN",
         clarification_question="Как должно было быть правильно?" if correction_intent == "UNKNOWN" else "",
     )
+
+
+def _fallback_issue_recurrence(
+    issue: SystemIssueRecord,
+    issue_url: str,
+    candidates: list[SystemIssueSummary],
+    *,
+    force_improvement: bool,
+) -> IssueRecurrenceAnalysis:
+    direction = _issue_direction(issue)
+    related = [
+        candidate.url
+        for candidate in candidates
+        if candidate.url
+        and candidate.url != issue_url
+        and candidate.issue_type == issue.classification.issue_type
+        and candidate.database == issue.classification.database
+        and direction
+        and _summary_direction(candidate) == direction
+    ]
+    should_offer = len(related) >= 2 or (len(related) >= 1 and issue.classification.severity == "Высокая") or force_improvement
+    priority = "Средний"
+    if issue.classification.severity == "Высокая" or len(related) >= 3:
+        priority = "Высокий"
+    elif not related:
+        priority = "Низкий"
+    title = _fallback_improvement_title(issue, direction)
+    return IssueRecurrenceAnalysis(
+        is_recurring=should_offer,
+        related_issue_urls=related,
+        recurrence_group_title=title if should_offer else "",
+        similarity_reason=(
+            f"Одинаковые тип ошибки, база и направление исправления: {direction}."
+            if direction and related
+            else "Детерминированная группировка не нашла достаточной содержательной близости."
+        ),
+        confidence=0.65 if should_offer else 0.0,
+        suggested_improvement_title=title if should_offer else "",
+        suggested_improvement_description=(
+            f"Обнаружены похожие ошибки типа «{issue.classification.issue_type}» в базе «{issue.classification.database}»."
+            if should_offer
+            else ""
+        ),
+        suggested_change=(
+            "Проверить и уточнить правила классификации/маршрутизации для этого направления исправления. "
+            "Добавить regression-тесты на найденные примеры."
+            if should_offer
+            else ""
+        ),
+        improvement_type="Правило",
+        change_location="Правила Дирижёра",
+        priority=priority,
+    )
+
+
+def _issue_for_recurrence(issue: SystemIssueRecord, issue_url: str) -> dict[str, Any]:
+    return {
+        "url": issue_url,
+        "issue_type": issue.classification.issue_type,
+        "severity": issue.classification.severity,
+        "database": issue.classification.database,
+        "actual_result": issue.classification.actual_result,
+        "expected_result": issue.classification.expected_result,
+        "correction_intent": issue.classification.correction_intent,
+        "correction_target_type": issue.classification.correction_target_type,
+        "corrected_fields": issue.classification.corrected_fields,
+        "input_data": issue.input_data,
+        "description": issue.description,
+    }
+
+
+def _candidate_for_recurrence(candidate: SystemIssueSummary) -> dict[str, Any]:
+    return {
+        "url": candidate.url,
+        "title": candidate.title,
+        "issue_type": candidate.issue_type,
+        "severity": candidate.severity,
+        "database": candidate.database,
+        "input_data": candidate.input_data,
+        "description": candidate.description,
+        "solution": candidate.solution,
+        "detected_date": candidate.detected_date,
+    }
+
+
+def _issue_direction(issue: SystemIssueRecord) -> str:
+    classification = issue.classification
+    if classification.correction_intent == "CHANGE_ENTITY_TYPE" and classification.correction_target_type:
+        source = _infer_actual_entity_type(classification.actual_result)
+        return f"{source}->{classification.correction_target_type}" if source else f"->{classification.correction_target_type}"
+    if classification.corrected_fields:
+        return ",".join(sorted(field.casefold() for field in classification.corrected_fields))
+    if classification.correction_intent in {"CREATE_MISSING_RECORD", "UPDATE_WRONG_RECORD", "NO_ACTION_EXPECTED"}:
+        return classification.correction_intent
+    return ""
+
+
+def _summary_direction(candidate: SystemIssueSummary) -> str:
+    combined = " ".join([candidate.title, candidate.description, candidate.solution, candidate.input_data]).casefold()
+    if _mentions_any(combined, ("study", "изучение")) and _mentions_any(combined, ("goods", "товар", "buy", "покуп")):
+        return "Study->Goods"
+    if _mentions_any(combined, ("task", "задач")) and _mentions_any(combined, ("goods", "товар", "buy", "покуп")):
+        return "Task->Goods"
+    if _mentions_any(combined, ("goods", "товар", "buy", "покуп")) and _mentions_any(combined, ("study", "изучение")):
+        return "Goods->Study"
+    if _mentions_any(combined, ("date", "дата", "срок", "завтра", "сегодня")):
+        return "date"
+    if _mentions_any(combined, ("time", "время", "час", "15:00")):
+        return "time"
+    if _mentions_any(combined, ("project", "проект")):
+        return "project"
+    if "не создан" in combined or "не создала" in combined:
+        return "CREATE_MISSING_RECORD"
+    if "не ту" in combined or "не та запись" in combined:
+        return "UPDATE_WRONG_RECORD"
+    if "ничего создавать" in combined or "не надо создавать" in combined:
+        return "NO_ACTION_EXPECTED"
+    return ""
+
+
+def _infer_actual_entity_type(actual_result: str) -> str:
+    lower = actual_result.casefold()
+    for entity, key in (("Task", "tasks"), ("Study", "studies"), ("Goods", "goods")):
+        match = re.search(rf'"{key}"\s*:\s*([1-9]\d*)', lower)
+        if match:
+            return entity
+    counts = {
+        "Task": _count_entity(lower, "tasks", "задач", "task"),
+        "Study": _count_entity(lower, "studies", "изуч", "study"),
+        "Goods": _count_entity(lower, "goods", "товар", "buy"),
+    }
+    entity, count = max(counts.items(), key=lambda item: item[1])
+    return entity if count > 0 else ""
+
+
+def _count_entity(text: str, *markers: str) -> int:
+    return sum(text.count(marker) for marker in markers)
+
+
+def _mentions_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _fallback_improvement_title(issue: SystemIssueRecord, direction: str) -> str:
+    if direction.endswith("->Goods") or issue.classification.database == "BUY":
+        return "Уточнить классификацию товаров"
+    if "date" in direction:
+        return "Уточнить извлечение дат"
+    if "time" in direction:
+        return "Уточнить извлечение времени"
+    return f"Уточнить обработку ошибок: {issue.classification.issue_type}"
 
 
 def _summarize_actual_context(actual_context: dict[str, Any]) -> str:

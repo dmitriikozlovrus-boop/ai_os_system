@@ -68,6 +68,18 @@ CORRECTION_INTENTS = {
     "UNKNOWN",
 }
 CORRECTION_TARGET_TYPES = {"Task", "Study", "Goods", "Event", "Other", "None", "Unknown"}
+IMPROVEMENT_TYPES = {"Правило", "Промпт", "Архитектура", "Поля базы", "Интеграция", "Автоматизация"}
+IMPROVEMENT_CHANGE_LOCATIONS = {
+    "Правила Дирижёра",
+    "Правила Любы",
+    "Notion",
+    "Todoist",
+    "Google Calendar",
+    "Telegram",
+    "Другое",
+}
+IMPROVEMENT_PRIORITIES = {"Высокий", "Средний", "Низкий"}
+IMPROVEMENT_OPEN_STATUSES = {"Идея", "В работе", "Отложено"}
 
 
 @dataclass
@@ -154,6 +166,57 @@ class SystemIssueRecord:
     solution: str
     detected_date: str
     fingerprint: str
+
+
+@dataclass
+class SystemIssueSummary:
+    page_id: str
+    url: str
+    title: str
+    issue_type: str
+    severity: str
+    database: str
+    input_data: str
+    description: str
+    solution: str
+    detected_date: str
+
+
+@dataclass
+class ImprovementRecord:
+    title: str
+    description: str
+    suggested_change: str
+    improvement_type: str
+    change_location: str
+    priority: str
+    status: str = "Идея"
+
+
+@dataclass
+class ImprovementSummary:
+    page_id: str
+    url: str
+    title: str
+    status: str
+    improvement_type: str
+    change_location: str
+    related_issue_urls: list[str] = field(default_factory=list)
+
+
+@dataclass
+class IssueRecurrenceAnalysis:
+    is_recurring: bool
+    related_issue_urls: list[str]
+    recurrence_group_title: str
+    similarity_reason: str
+    confidence: float
+    suggested_improvement_title: str
+    suggested_improvement_description: str
+    suggested_change: str
+    improvement_type: str
+    change_location: str
+    priority: str
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -284,4 +347,24 @@ def system_issue_classification_from_dict(data: dict[str, Any]) -> SystemIssueCl
         should_delete_original=bool(data.get("should_delete_original", False)),
         needs_user_clarification=bool(data.get("needs_user_clarification", False)),
         clarification_question=str(data.get("clarification_question") or "").strip(),
+    )
+
+
+def issue_recurrence_analysis_from_dict(data: dict[str, Any]) -> IssueRecurrenceAnalysis:
+    improvement_type = str(data.get("improvement_type") or "Правило").strip()
+    change_location = str(data.get("change_location") or "Правила Дирижёра").strip()
+    priority = str(data.get("priority") or "Средний").strip()
+    confidence = max(0.0, min(_as_float(data.get("confidence"), 0.0), 1.0))
+    return IssueRecurrenceAnalysis(
+        is_recurring=bool(data.get("is_recurring", False)),
+        related_issue_urls=[str(value) for value in data.get("related_issue_urls", []) if str(value).strip()],
+        recurrence_group_title=str(data.get("recurrence_group_title") or "").strip(),
+        similarity_reason=str(data.get("similarity_reason") or "").strip(),
+        confidence=confidence,
+        suggested_improvement_title=str(data.get("suggested_improvement_title") or "").strip(),
+        suggested_improvement_description=str(data.get("suggested_improvement_description") or "").strip(),
+        suggested_change=str(data.get("suggested_change") or "").strip(),
+        improvement_type=improvement_type if improvement_type in IMPROVEMENT_TYPES else "Правило",
+        change_location=change_location if change_location in IMPROVEMENT_CHANGE_LOCATIONS else "Правила Дирижёра",
+        priority=priority if priority in IMPROVEMENT_PRIORITIES else "Средний",
     )

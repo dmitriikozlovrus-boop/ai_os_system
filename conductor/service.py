@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import Settings
 from .interactions import InteractionStore
-from .models import Classification, GoodsItem, StudyItem, SystemIssueRecord, TaskItem
+from .models import Classification, GoodsItem, ImprovementRecord, IssueRecurrenceAnalysis, StudyItem, SystemIssueRecord, TaskItem
 from .notion_client import NotionClient
 from .openai_client import OpenAIClient, _extract_due_date, _normalize_area
 from .pending import PendingStore
@@ -34,6 +34,7 @@ class ConductorService:
             projects_db=settings.notion_projects_database_id,
             goods_db=settings.notion_goods_database_id,
             system_issues_db=settings.notion_system_issues_database_id,
+            improvements_db=settings.notion_improvements_database_id,
         )
         self.telegram = TelegramClient(settings.telegram_bot_token)
         # A configured token is enough to enable the client. The dedicated
@@ -369,7 +370,7 @@ class ConductorService:
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback clarification requested"], "issue_url": issue_url}
 
         feedback = {
-            "state": "awaiting_fix_confirmation",
+            "state": "awaiting_correction_confirmation",
             "command": command,
             "correction": correction.strip(),
             "interaction": interaction,
@@ -378,6 +379,7 @@ class ConductorService:
         }
         self.interactions.update_feedback(chat_id, feedback)
         self._send_message(chat_id, _format_issue_saved(issue))
+        self._prepare_improvement_offer(chat_id, issue=issue, issue_url=issue_url, command=command, correction=correction)
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback issue saved"], "issue_url": issue_url}
 
     def _handle_feedback_followup(
@@ -389,7 +391,7 @@ class ConductorService:
         feedback: dict[str, Any],
     ) -> dict[str, Any]:
         state = feedback.get("state")
-        if state == "awaiting_fix_confirmation":
+        if state in {"awaiting_correction_confirmation", "awaiting_fix_confirmation"}:
             self.interactions.pop_feedback(chat_id)
             if _looks_like_yes(text):
                 original = str((feedback.get("interaction") or {}).get("input_text") or "")
@@ -406,9 +408,31 @@ class ConductorService:
                     except Exception as exc:  # noqa: BLE001
                         print(f"ISSUE_CAPTURE_ERROR update: {exc}", flush=True)
                 self._send_message(chat_id, _format_fix_completed(result))
+                self._offer_queued_improvement(chat_id, feedback)
                 return result
             self._send_message(chat_id, "Хорошо, запись сейчас не исправляю.")
+            self._offer_queued_improvement(chat_id, feedback)
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback fix declined"]}
+        if state == "awaiting_improvement_confirmation":
+            self.interactions.pop_feedback(chat_id)
+            if _looks_like_improvement_yes(text):
+                return self._create_confirmed_improvement(chat_id, feedback)
+            if _looks_like_improvement_no(text):
+                self._send_message(chat_id, "Хорошо, Improvement не создаю.")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["improvement declined"]}
+            self.interactions.update_feedback(chat_id, feedback)
+            self._send_message(chat_id, "Ответь, пожалуйста: создать Improvement? Да или Нет.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["improvement confirmation unclear"]}
+        if state == "awaiting_existing_improvement_link_confirmation":
+            self.interactions.pop_feedback(chat_id)
+            if _looks_like_improvement_yes(text):
+                return self._link_existing_improvement(chat_id, feedback)
+            if _looks_like_improvement_no(text):
+                self._send_message(chat_id, "Хорошо, не связываю с существующим Improvement.")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["existing improvement link declined"]}
+            self.interactions.update_feedback(chat_id, feedback)
+            self._send_message(chat_id, "Ответь, пожалуйста: связать с существующим Improvement? Да или Нет.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["existing improvement confirmation unclear"]}
 
         interaction = feedback.get("interaction") or {}
         return self._capture_feedback(
@@ -418,6 +442,149 @@ class ConductorService:
             interaction=interaction,
             command=str(feedback.get("command") or ""),
         )
+
+    def _prepare_improvement_offer(
+        self,
+        chat_id: int,
+        *,
+        issue: SystemIssueRecord,
+        issue_url: str,
+        command: str,
+        correction: str,
+    ) -> None:
+        system_issue_id = _safe_notion_page_id(issue_url)
+        if not _system_improvements_enabled(getattr(self, "settings", None)) or not getattr(self.notion, "improvements_db", ""):
+            print(
+                f"ISSUE_RECURRENCE_NO_MATCH system_issue_id={system_issue_id} state=disabled",
+                flush=True,
+            )
+            return
+        try:
+            print(f"ISSUE_RECURRENCE_STARTED system_issue_id={system_issue_id}", flush=True)
+            candidates = self.notion.list_recent_system_issues(
+                issue_type=issue.classification.issue_type,
+                database=issue.classification.database,
+                days=90,
+                limit=30,
+            )
+            if not isinstance(candidates, list):
+                candidates = []
+            print(
+                f"ISSUE_RECURRENCE_CANDIDATES_FOUND system_issue_id={system_issue_id} candidate_count={len(candidates)}",
+                flush=True,
+            )
+            force = _wants_systemic_improvement(command) or _wants_systemic_improvement(correction)
+            candidates = [candidate for candidate in candidates if candidate.url != issue_url]
+            analysis = self.openai.analyze_issue_recurrence(
+                issue=issue,
+                issue_url=issue_url,
+                candidates=candidates,
+                force_improvement=force,
+            )
+            if not analysis.is_recurring and not force:
+                print(
+                    f"ISSUE_RECURRENCE_NO_MATCH system_issue_id={system_issue_id} candidate_count={len(candidates)}",
+                    flush=True,
+                )
+                return
+            related_issue_urls = _dedupe_urls([issue_url, *analysis.related_issue_urls])
+            existing = self.notion.find_open_improvements_for_issues(
+                related_issue_urls=related_issue_urls,
+                title=analysis.suggested_improvement_title,
+                improvement_type=analysis.improvement_type,
+                change_location=analysis.change_location,
+            )
+            current = self.interactions.get_feedback(chat_id) or {}
+            if existing:
+                current["next_improvement"] = {
+                    "mode": "link_existing",
+                    "system_issue_url": issue_url,
+                    "related_issue_urls": related_issue_urls,
+                    "existing_improvement": existing[0].__dict__,
+                    "analysis": analysis.__dict__,
+                }
+            else:
+                current["next_improvement"] = {
+                    "mode": "create",
+                    "system_issue_url": issue_url,
+                    "related_issue_urls": related_issue_urls,
+                    "analysis": analysis.__dict__,
+                }
+            self.interactions.update_feedback(chat_id, current)
+            print(
+                f"IMPROVEMENT_PROPOSED system_issue_id={system_issue_id} state={current['next_improvement']['mode']}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - recurrence must not break feedback capture.
+            print(f"ISSUE_RECURRENCE_ERROR: {exc}", flush=True)
+
+    def _offer_queued_improvement(self, chat_id: int, feedback: dict[str, Any]) -> None:
+        offer = feedback.get("next_improvement")
+        if not offer:
+            return
+        if offer.get("mode") == "link_existing":
+            existing = offer.get("existing_improvement") or {}
+            self.interactions.update_feedback(
+                chat_id,
+                {
+                    "state": "awaiting_existing_improvement_link_confirmation",
+                    "system_issue_url": offer.get("system_issue_url"),
+                    "related_issue_urls": offer.get("related_issue_urls", []),
+                    "existing_improvement": existing,
+                    "analysis": offer.get("analysis", {}),
+                },
+            )
+            self._send_message(chat_id, _format_existing_improvement_offer(existing))
+            return
+        analysis = IssueRecurrenceAnalysis(**offer.get("analysis", {}))
+        self.interactions.update_feedback(
+            chat_id,
+            {
+                "state": "awaiting_improvement_confirmation",
+                "system_issue_url": offer.get("system_issue_url"),
+                "related_issue_urls": offer.get("related_issue_urls", []),
+                "analysis": analysis.__dict__,
+            },
+        )
+        self._send_message(chat_id, _format_improvement_offer(analysis, len(offer.get("related_issue_urls", []))))
+
+    def _create_confirmed_improvement(self, chat_id: int, feedback: dict[str, Any]) -> dict[str, Any]:
+        analysis = IssueRecurrenceAnalysis(**feedback.get("analysis", {}))
+        improvement = ImprovementRecord(
+            title=analysis.suggested_improvement_title,
+            description=analysis.suggested_improvement_description,
+            suggested_change=analysis.suggested_change,
+            improvement_type=analysis.improvement_type,
+            change_location=analysis.change_location,
+            priority=analysis.priority,
+            status="Идея",
+        )
+        try:
+            print("IMPROVEMENT_CREATE_STARTED state=create", flush=True)
+            url = self.notion.create_improvement(improvement, related_issue_urls=feedback.get("related_issue_urls", []))
+        except Exception as exc:  # noqa: BLE001
+            print(f"IMPROVEMENT_CREATE_ERROR: {exc}", flush=True)
+            self._send_message(chat_id, f"Не смогла создать Improvement: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["improvement create failed"]}
+        print(f"IMPROVEMENT_CREATED improvement_id={_safe_notion_page_id(url)}", flush=True)
+        self._send_message(chat_id, f"Improvement создан:\n{url}")
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["improvement created"], "improvement_url": url}
+
+    def _link_existing_improvement(self, chat_id: int, feedback: dict[str, Any]) -> dict[str, Any]:
+        existing = feedback.get("existing_improvement") or {}
+        related_issue_urls = _dedupe_urls(list(existing.get("related_issue_urls") or []) + list(feedback.get("related_issue_urls", [])))
+        try:
+            self.notion.add_issues_to_improvement(
+                str(existing.get("page_id") or _extract_notion_page_id(str(existing.get("url") or ""))),
+                related_issue_urls=related_issue_urls,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"IMPROVEMENT_LINK_ERROR: {exc}", flush=True)
+            self._send_message(chat_id, f"Не смогла связать Improvement с ошибкой: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["improvement link failed"]}
+        print(f"IMPROVEMENT_LINKED_EXISTING improvement_id={existing.get('page_id') or ''}", flush=True)
+        self._send_message(chat_id, "Связала ошибку с существующим Improvement.")
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["improvement linked"]}
 
     def _build_system_issue(
         self,
@@ -582,6 +749,39 @@ def _looks_like_no(text: str) -> bool:
     return text.strip().casefold() in {"нет", "оставь", "не надо", "нет, оставь"}
 
 
+def _looks_like_improvement_yes(text: str) -> bool:
+    return text.strip().casefold() in {"да", "создай", "создай улучшение", "да, создай", "yes", "y"}
+
+
+def _looks_like_improvement_no(text: str) -> bool:
+    return text.strip().casefold() in {"нет", "не надо", "пропусти", "позже", "нет, не надо"}
+
+
+def _wants_systemic_improvement(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(
+        marker in normalized
+        for marker in (
+            "создай улучшение",
+            "добавь правило",
+            "исправить системно",
+            "чтобы больше так не происходило",
+            "чтобы больше так не было",
+        )
+    )
+
+
+def _dedupe_urls(urls: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    for url in urls:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        result.append(url)
+    return result
+
+
 def _feedback_prompt() -> str:
     return (
         "Поняла.\n\n"
@@ -639,6 +839,29 @@ def _format_fix_completed(result: dict[str, Any]) -> str:
     )
 
 
+def _format_improvement_offer(analysis: IssueRecurrenceAnalysis, related_count: int) -> str:
+    return (
+        "Похоже, эта ошибка повторяется.\n\n"
+        f"Найдено похожих случаев: {max(0, related_count - 1)}.\n\n"
+        "Предлагаемое улучшение:\n"
+        f"{analysis.suggested_improvement_title}\n\n"
+        "Создать Improvement?\n"
+        "Да\n"
+        "Нет"
+    )
+
+
+def _format_existing_improvement_offer(existing: dict[str, Any]) -> str:
+    return (
+        "Для этой проблемы уже есть Improvement:\n\n"
+        f"{existing.get('title') or 'Без названия'}\n"
+        f"Статус: {existing.get('status') or 'Не указан'}\n\n"
+        "Связать с ним новую ошибку?\n"
+        "Да\n"
+        "Нет"
+    )
+
+
 def _classification_payload(classification: Classification) -> dict[str, Any]:
     return {
         "tasks": [item.__dict__ for item in classification.tasks],
@@ -693,6 +916,17 @@ def _extract_telegram_message_id(result: Any) -> int | None:
 
 def _safe_error(exc: Exception) -> str:
     return str(exc).splitlines()[0][:500]
+
+
+def _safe_notion_page_id(value: str) -> str:
+    try:
+        return _extract_notion_page_id(value)
+    except Exception:  # noqa: BLE001 - logging should never affect the runtime path.
+        return ""
+
+
+def _system_improvements_enabled(settings: Any) -> bool:
+    return getattr(settings, "system_improvements_enabled", False) is True
 
 
 def _edit_guidance_message() -> str:
