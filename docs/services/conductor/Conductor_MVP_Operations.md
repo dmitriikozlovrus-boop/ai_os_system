@@ -123,6 +123,7 @@ python3 -m conductor.cli "Завтра напомни написать Марк�
 - генерация технического задания из Improvement выключена по умолчанию и управляется `TECHNICAL_SPEC_GENERATION_ENABLED`.
 - накопительный backlog feedback выключен по умолчанию и управляется `FEEDBACK_BACKLOG_ENABLED`.
 - AI triage backlog выключен по умолчанию и управляется `BACKLOG_AI_TRIAGE_ENABLED`.
+- production write для feedback/backlog hardening заблокирован dry-run флагом `BACKLOG_PRODUCTION_DRY_RUN=true`.
 
 ## Improvement → Codex Task
 
@@ -194,11 +195,20 @@ docs/product/use_cases/UC_006_Backlog_AI_Triage.md
 - merge не удаляет вторичный Improvement, а переводит его в `Отложено`;
 - split доступен только как preview;
 - переход в Technical Spec flow возможен только по явному выбору пользователя и при достаточной readiness.
+- перед handoff создается snapshot выбранного Improvement и проверяется stale-состояние.
+- diagnostics не создает и не изменяет Notion records.
 
 Feature flag:
 
 ```bash
 BACKLOG_AI_TRIAGE_ENABLED=false
+BACKLOG_PRODUCTION_DRY_RUN=true
+```
+
+Сценарий перехода из backlog в технический анализ:
+
+```text
+docs/product/use_cases/UC_007_Backlog_To_Technical_Analysis.md
 ```
 
 ## TASKS ↔ Todoist
@@ -410,6 +420,7 @@ SYSTEM_IMPROVEMENTS_ENABLED
 TECHNICAL_SPEC_GENERATION_ENABLED
 FEEDBACK_BACKLOG_ENABLED
 BACKLOG_AI_TRIAGE_ENABLED
+BACKLOG_PRODUCTION_DRY_RUN
 TODOIST_API_TOKEN
 TODOIST_WEBHOOK_SECRET
 TASK_SYNC_SECRET
@@ -600,6 +611,15 @@ SYSTEM_IMPROVEMENTS_ENABLED=false
 `BACKLOG_AI_TRIAGE_ENABLED=false` — безопасный режим по умолчанию. В нем AI enrichment, semantic matching, triage, duplicate merge proposals и implementation candidates не запускаются.
 
 `BACKLOG_AI_TRIAGE_ENABLED=true` включает optional AI enrichment после deterministic normalization, semantic matching открытых Improvements, readiness-разбор backlog, clarification questions, merge preview/confirmation и безопасный handoff в existing Technical Spec flow.
+
+`BACKLOG_PRODUCTION_DRY_RUN=true` — безопасный режим по умолчанию. В нем разрешены чтение, diagnostics, OpenAI preview и readiness, но заблокированы Notion writes для System Issues, Improvements, relations, priority/status, feedback summary и Technical Spec.
+
+Безопасные smoke-команды:
+
+```bash
+python3 -m conductor.feedback_backlog_smoke --validate-only
+python3 -m conductor.feedback_backlog_smoke --dry-run
+```
 
 Ограничения MVP:
 

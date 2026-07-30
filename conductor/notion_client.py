@@ -11,6 +11,7 @@ from .models import (
     IMPROVEMENT_PRIORITIES,
     IMPROVEMENT_TYPES,
     GoodsItem,
+    IntegrationValidationResult,
     ImprovementRecord,
     ImprovementSummary,
     StudyItem,
@@ -290,6 +291,14 @@ class NotionClient:
         data = request_json("GET", f"https://api.notion.com/v1/pages/{page_id}", headers=self.headers)
         return _improvement_summary(data)
 
+    def retrieve_database(self, database_id: str) -> dict[str, Any]:
+        return request_json("GET", f"https://api.notion.com/v1/databases/{database_id}", headers=self.headers)
+
+    def validate_feedback_backlog_schema(self) -> list[IntegrationValidationResult]:
+        from .integration_validation import validate_feedback_backlog_schema
+
+        return validate_feedback_backlog_schema(self)
+
     def get_system_issues_by_references(self, issue_refs: list[str], *, limit: int = 10) -> list[SystemIssueSummary]:
         issues = []
         for reference in issue_refs[:limit]:
@@ -300,15 +309,15 @@ class NotionClient:
 
     def save_improvement_technical_spec(self, improvement_ref: str, markdown: str, *, today: str) -> None:
         page_id = notion_page_id_from_reference(improvement_ref)
-        self._archive_existing_technical_spec(page_id)
-        payload = {
-            "children": _technical_spec_blocks(markdown, today=today),
-        }
-        request_json(
-            "PATCH",
-            f"https://api.notion.com/v1/blocks/{page_id}/children",
-            headers=self.headers,
-            payload=payload,
+        blocks = self._list_block_children(page_id)
+        self._replace_managed_section(
+            page_id,
+            blocks,
+            start_marker="CONDUCTOR_TECH_SPEC_START",
+            end_marker="CONDUCTOR_TECH_SPEC_END",
+            children=_technical_spec_blocks(markdown, today=today),
+            heading="Техническое задание для Codex",
+            allow_legacy_heading=True,
         )
 
     def update_improvement_feedback_summary(self, improvement_ref: str, markdown: str) -> None:
@@ -365,17 +374,28 @@ class NotionClient:
         end_marker: str,
         children: list[dict[str, Any]],
         heading: str,
+        allow_legacy_heading: bool = False,
     ) -> None:
         start_indexes = [index for index, block in enumerate(blocks) if start_marker in _block_plain_text(block)]
         end_indexes = [index for index, block in enumerate(blocks) if end_marker in _block_plain_text(block)]
+        heading_indexes = [index for index, block in enumerate(blocks) if _block_plain_text(block).strip() == heading]
         if len(start_indexes) > 1 or len(end_indexes) > 1:
+            print("MANAGED_SECTION_VALIDATION_FAILED state=conflicting_markers", flush=True)
             raise RuntimeError("Conflicting managed section markers")
-        if end_indexes and not start_indexes:
+        if end_indexes and not start_indexes and not allow_legacy_heading:
+            print("MANAGED_SECTION_VALIDATION_FAILED state=end_without_start", flush=True)
             raise RuntimeError("Managed section end marker without start marker")
+        if not start_indexes and end_indexes and allow_legacy_heading:
+            candidates = [index for index in heading_indexes if index < end_indexes[0]]
+            if len(candidates) != 1:
+                print("MANAGED_SECTION_VALIDATION_FAILED state=ambiguous_legacy_section", flush=True)
+                raise RuntimeError("Legacy managed section is ambiguous")
+            start_indexes = [candidates[0]]
         if start_indexes:
             start = start_indexes[0]
             end = next((index for index in end_indexes if index >= start), None)
             if end is None:
+                print("MANAGED_SECTION_VALIDATION_FAILED state=end_missing", flush=True)
                 raise RuntimeError("Managed section end marker is missing")
             archive_from = start - 1 if start > 0 and _block_plain_text(blocks[start - 1]).strip() == heading else start
             for block in blocks[archive_from : end + 1]:
@@ -581,6 +601,7 @@ def _improvement_summary(row: dict[str, Any]) -> ImprovementSummary:
         priority=_select(props.get("Приоритет")),
         description=_rich_text(props.get("Описание")),
         suggested_change=_rich_text(props.get("Что изменить")),
+        last_edited_time=str(row.get("last_edited_time") or ""),
     )
 
 
@@ -593,6 +614,7 @@ def _technical_spec_blocks(markdown: str, *, today: str) -> list[dict[str, Any]]
         },
         _paragraph_block("Статус проекта ТЗ: Черновик"),
         _paragraph_block(f"Дата формирования: {today}"),
+        _paragraph_block("<!-- CONDUCTOR_TECH_SPEC_START -->"),
     ]
     for chunk in _chunks(markdown, 1800):
         blocks.append(_paragraph_block(chunk))

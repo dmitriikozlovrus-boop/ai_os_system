@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 from .feedback_backlog import choose_matching_improvement, normalize_feedback, score_improvement_match
@@ -9,9 +12,12 @@ from .models import (
     BacklogReadiness,
     BacklogSplitProposal,
     FeedbackEnrichment,
+    ImprovementPairAssessment,
+    ImprovementSelectionSnapshot,
     ImprovementMatchCandidate,
     ImprovementSummary,
     NormalizedFeedback,
+    ResolvedImprovementContext,
 )
 
 
@@ -19,6 +25,8 @@ FEEDBACK_KINDS = {"CONCRETE_ERROR", "GENERAL_PROBLEM", "IMPROVEMENT_IDEA", "CORR
 DATABASES = {"TASKS", "PROBLEMS", "Study / На изучение", "EVENTS", "IDEAS", "COMMUNICATIONS", "CONTACTS", "FILMS", "BOOKS", "BUY", "SUBSCRIPTIONS", "Другое"}
 SEVERITIES = {"Высокая", "Средняя", "Низкая"}
 RELATION_TYPES = {"SAME_PROBLEM", "RELATED_PROBLEM", "POSSIBLE_MATCH", "NOT_RELATED"}
+PAIR_RELATION_TYPES = {"SAME_PROBLEM", "OVERLAPPING", "RELATED_BUT_DISTINCT", "NOT_RELATED"}
+CONTEXT_SOURCES = {"ACTIVE_STATE", "REPLY", "TRIAGE_LIST_NUMBER", "BACKLOG_LIST_NUMBER", "EXPLICIT_NOTION_URL", "LATEST_IN_CURRENT_CHAT"}
 
 
 def normalize_with_ai(
@@ -198,7 +206,8 @@ def format_triage_preview(pairs: list[tuple[ImprovementSummary, BacklogReadiness
                 [
                     f"{counter}. {item.title}",
                     f"Сигналов: {max(len(item.related_issue_urls), 0)}",
-                    f"Готовность: {readiness.score}/100",
+                    f"Оценка готовности системы: {readiness.score}/100",
+                    "Это вспомогательная оценка полноты данных, а не гарантия качества технического решения.",
                     f"Причина: {reason}",
                     "",
                 ]
@@ -240,6 +249,30 @@ def duplicate_pairs(items: list[ImprovementSummary], *, limit: int = 20) -> list
     return sorted(pairs, key=lambda item: item[2], reverse=True)
 
 
+def assess_duplicate_pairs(
+    *,
+    openai: Any,
+    items: list[ImprovementSummary],
+    enabled: bool,
+    limit: int = 20,
+) -> list[ImprovementPairAssessment]:
+    pairs = duplicate_pairs(items, limit=limit)
+    candidates = pairs[:30]
+    if not candidates:
+        return []
+    if enabled:
+        try:
+            assessed = openai.assess_improvement_pairs(
+                pairs=[{"left": left.__dict__, "right": right.__dict__, "deterministic_score": score} for left, right, score in candidates]
+            )
+            valid = [item for item in assessed if _valid_pair_assessment(item, candidates)]
+            if valid:
+                return sorted(valid, key=lambda item: item.score, reverse=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"BACKLOG_DUPLICATES_ANALYZED state=ai_fallback error={type(exc).__name__}", flush=True)
+    return [_fallback_pair_assessment(left, right, score) for left, right, score in candidates]
+
+
 def build_merge_proposal(primary: ImprovementSummary, secondary: ImprovementSummary) -> BacklogMergeProposal:
     relation_ids = []
     for page_id in [*primary.related_issue_urls, *secondary.related_issue_urls]:
@@ -267,6 +300,63 @@ def build_split_proposal(improvement: ImprovementSummary, signals: list[dict[str
     return BacklogSplitProposal(improvement.page_id, improvement.title, titles[:2], ["в одном Improvement видны разные ожидаемые изменения"])
 
 
+def feedback_summary_hash(signals: list[dict[str, Any]]) -> str:
+    normalized = json.dumps(signals or [], ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def build_selection_snapshot(
+    *,
+    improvement: ImprovementSummary,
+    readiness: BacklogReadiness,
+    signals: list[dict[str, Any]],
+    chat_id: int,
+    selected_at: str | None = None,
+) -> ImprovementSelectionSnapshot:
+    return ImprovementSelectionSnapshot(
+        improvement_id=improvement.page_id,
+        improvement_title=improvement.title,
+        improvement_last_edited_time=getattr(improvement, "last_edited_time", ""),
+        related_issue_ids=sorted(improvement.related_issue_urls),
+        feedback_summary_hash=feedback_summary_hash(signals),
+        readiness_status=readiness.status,
+        readiness_score=readiness.score,
+        selected_at=selected_at or datetime.now(timezone.utc).isoformat(),
+        chat_id=chat_id,
+    )
+
+
+def snapshot_stale_reason(
+    *,
+    snapshot: ImprovementSelectionSnapshot,
+    current: ImprovementSummary,
+    signals: list[dict[str, Any]],
+) -> str:
+    if snapshot.improvement_id != current.page_id:
+        return "page_id_changed"
+    if snapshot.improvement_last_edited_time and snapshot.improvement_last_edited_time != getattr(current, "last_edited_time", ""):
+        return "last_edited_time_changed"
+    if sorted(snapshot.related_issue_ids) != sorted(current.related_issue_urls):
+        return "relations_changed"
+    if snapshot.feedback_summary_hash != feedback_summary_hash(signals):
+        return "feedback_summary_changed"
+    return ""
+
+
+def resolved_context(
+    *,
+    improvement_id: str,
+    improvement_url: str,
+    source: str,
+    chat_id: int,
+    state_name: str = "",
+    confidence: float = 1.0,
+) -> ResolvedImprovementContext:
+    if source not in CONTEXT_SOURCES:
+        raise ValueError(f"Unsupported context source: {source}")
+    return ResolvedImprovementContext(improvement_id, improvement_url, source, chat_id, state_name, confidence)
+
+
 def implementation_candidates(pairs: list[tuple[ImprovementSummary, BacklogReadiness]]) -> list[tuple[ImprovementSummary, BacklogReadiness]]:
     ready = [pair for pair in pairs if pair[1].status in {"READY_FOR_IMPLEMENTATION_SELECTION", "READY_FOR_REVIEW"}]
     return sorted(ready, key=lambda pair: (-pair[1].score, _priority_rank(pair[0].priority), -len(pair[0].related_issue_urls)))[:5]
@@ -281,7 +371,8 @@ def format_implementation_candidates(candidates: list[tuple[ImprovementSummary, 
             [
                 "",
                 f"{index}. {item.title}",
-                f"Готовность: {readiness.score}/100",
+                f"Оценка готовности системы: {readiness.score}/100",
+                "Это вспомогательная оценка полноты данных, а не гарантия качества технического решения.",
                 "Почему сейчас:",
                 *[f"- {reason}" for reason in readiness.reasons[:3]],
                 "Риски:",
@@ -298,6 +389,27 @@ def format_duplicate_pairs(pairs: list[tuple[ImprovementSummary, ImprovementSumm
     for index, (left, right, score) in enumerate(pairs[:5], start=1):
         level = "высокая" if score >= 85 else "средняя"
         lines.extend(["", f"{index}. «{left.title}»", f"   и «{right.title}»", f"Вероятность: {level}", "Общая проблема: похожее ожидаемое изменение."])
+    return "\n".join(lines)
+
+
+def format_pair_assessments(items: list[ImprovementPairAssessment], by_id: dict[str, ImprovementSummary]) -> str:
+    if not items:
+        return "Возможные дубли не найдены."
+    lines = ["Возможные дубли:"]
+    for index, item in enumerate(items[:5], start=1):
+        left = by_id.get(item.left_id)
+        right = by_id.get(item.right_id)
+        lines.extend(
+            [
+                "",
+                f"{index}. «{left.title if left else item.left_id}»",
+                f"   и «{right.title if right else item.right_id}»",
+                f"Оценка: {item.score}/100",
+                f"Тип связи: {item.relation_type}",
+                f"Общая проблема: {item.shared_problem or 'похожа по смыслу'}",
+                "Merge не выполняю без отдельного подтверждения.",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -344,6 +456,31 @@ def _pair_score(left: ImprovementSummary, right: ImprovementSummary) -> int:
     if left.priority == right.priority:
         overlap += 5
     return min(overlap, 100)
+
+
+def _fallback_pair_assessment(left: ImprovementSummary, right: ImprovementSummary, score: int) -> ImprovementPairAssessment:
+    if score >= 90:
+        relation = "SAME_PROBLEM"
+    elif score >= 75:
+        relation = "OVERLAPPING"
+    elif score >= 60:
+        relation = "RELATED_BUT_DISTINCT"
+    else:
+        relation = "NOT_RELATED"
+    return ImprovementPairAssessment(
+        left_id=left.page_id,
+        right_id=right.page_id,
+        relation_type=relation,
+        score=score,
+        shared_problem="deterministic duplicate preview",
+        differences=[],
+        merge_recommended=relation == "SAME_PROBLEM" and score >= 90,
+    )
+
+
+def _valid_pair_assessment(item: ImprovementPairAssessment, pairs: list[tuple[ImprovementSummary, ImprovementSummary, int]]) -> bool:
+    allowed = {(left.page_id, right.page_id) for left, right, _ in pairs} | {(right.page_id, left.page_id) for left, right, _ in pairs}
+    return (item.left_id, item.right_id) in allowed and item.relation_type in PAIR_RELATION_TYPES and 0 <= item.score <= 100
 
 
 def _priority_rank(priority: str) -> int:

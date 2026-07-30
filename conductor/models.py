@@ -205,6 +205,7 @@ class ImprovementSummary:
     priority: str = ""
     description: str = ""
     suggested_change: str = ""
+    last_edited_time: str = ""
 
 
 @dataclass
@@ -328,6 +329,59 @@ class BacklogSplitProposal:
     current_title: str
     suggested_titles: list[str]
     reasons: list[str]
+
+
+@dataclass
+class ResolvedImprovementContext:
+    improvement_id: str
+    improvement_url: str
+    source: str
+    chat_id: int
+    state_name: str
+    confidence: float
+
+
+@dataclass
+class ImprovementSelectionSnapshot:
+    improvement_id: str
+    improvement_title: str
+    improvement_last_edited_time: str
+    related_issue_ids: list[str]
+    feedback_summary_hash: str
+    readiness_status: str
+    readiness_score: int
+    selected_at: str
+    chat_id: int
+
+
+@dataclass
+class IntegrationValidationResult:
+    integration: str
+    valid: bool
+    errors: list[str]
+    warnings: list[str]
+    checked_at: str
+
+
+@dataclass
+class BacklogDecision:
+    improvement_id: str
+    decision: str
+    readiness_status: str
+    readiness_score: int
+    decided_at: str
+    chat_id: int
+
+
+@dataclass
+class ImprovementPairAssessment:
+    left_id: str
+    right_id: str
+    relation_type: str
+    score: int
+    shared_problem: str
+    differences: list[str]
+    merge_recommended: bool
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -533,4 +587,16 @@ def improvement_match_candidate_from_dict(data: dict[str, Any]) -> ImprovementMa
         relation_type=str(data.get("relation_type") or "NOT_RELATED").strip(),
         reasons=[str(value) for value in data.get("reasons", []) if str(value).strip()],
         contradictions=[str(value) for value in data.get("contradictions", []) if str(value).strip()],
+    )
+
+
+def improvement_pair_assessment_from_dict(data: dict[str, Any]) -> ImprovementPairAssessment:
+    return ImprovementPairAssessment(
+        left_id=str(data.get("left_id") or "").strip(),
+        right_id=str(data.get("right_id") or "").strip(),
+        relation_type=str(data.get("relation_type") or "NOT_RELATED").strip(),
+        score=max(0, min(_as_int(data.get("score")) or 0, 100)),
+        shared_problem=str(data.get("shared_problem") or "").strip(),
+        differences=[str(value) for value in data.get("differences", []) if str(value).strip()],
+        merge_recommended=bool(data.get("merge_recommended", False)),
     )

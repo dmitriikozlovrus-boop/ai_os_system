@@ -6,7 +6,36 @@ import re
 from datetime import date
 from typing import Any
 
+from .backlog_helpers import (
+    backlog_filters as _backlog_filters,
+    backlog_index_from_text as _backlog_index_from_text,
+    format_backlog_detail as _format_backlog_detail,
+    format_backlog_existing_offer as _format_backlog_existing_offer,
+    format_backlog_list as _format_backlog_list,
+    format_backlog_new_offer as _format_backlog_new_offer,
+    format_semantic_match_options as _format_semantic_match_options,
+    format_split_proposal as _format_split_proposal,
+    improvement_location as _improvement_location,
+    looks_like_backlog_ai_triage_request as _looks_like_backlog_ai_triage_request,
+    looks_like_backlog_browse_request as _looks_like_backlog_browse_request,
+    looks_like_backlog_diagnostics_request as _looks_like_backlog_diagnostics_request,
+    looks_like_backlog_feedback as _looks_like_backlog_feedback,
+    looks_like_backlog_management_request as _looks_like_backlog_management_request,
+    looks_like_backlog_open_request as _looks_like_backlog_open_request,
+    looks_like_backlog_triage_open_request as _looks_like_backlog_triage_open_request,
+    looks_like_duplicate_request as _looks_like_duplicate_request,
+    looks_like_existing_technical_spec_selection as _looks_like_existing_technical_spec_selection,
+    looks_like_implementation_candidates_request as _looks_like_implementation_candidates_request,
+    looks_like_split_request as _looks_like_split_request,
+    priority_from_text as _priority_from_text,
+    sort_backlog_items as _sort_backlog_items,
+    status_from_text as _status_from_text,
+    wants_backlog_create as _wants_backlog_create,
+    wants_separate_improvement as _wants_separate_improvement,
+)
 from .backlog_triage import (
+    assess_duplicate_pairs,
+    build_selection_snapshot,
     build_merge_proposal,
     build_split_proposal,
     calculate_readiness,
@@ -15,13 +44,16 @@ from .backlog_triage import (
     duplicate_pairs,
     format_duplicate_pairs,
     format_implementation_candidates,
+    format_pair_assessments,
     format_triage_preview,
+    snapshot_stale_reason,
     implementation_candidates,
     normalize_with_ai,
     semantic_match_improvements,
     triage_backlog,
 )
 from .config import Settings
+from .backlog_context import resolve_improvement_context
 from .feedback_backlog import (
     build_feedback_system_issue,
     choose_matching_improvement,
@@ -31,12 +63,14 @@ from .feedback_backlog import (
     signal_payload,
 )
 from .interactions import InteractionStore
+from .integration_validation import validate_feedback_backlog_schema, validate_openai_contracts
 from .models import (
     BacklogPriorityRecommendation,
     Classification,
     GoodsItem,
     ImprovementRecord,
     ImprovementSummary,
+    ImprovementSelectionSnapshot,
     IssueRecurrenceAnalysis,
     NormalizedFeedback,
     StudyItem,
@@ -102,6 +136,7 @@ class ConductorService:
         self.recent = RecentStore(settings.recent_store_path)
         self.interactions = InteractionStore(settings.interaction_store_path)
         self.repository_context = RepositoryContextProvider()
+        _log_startup_diagnostics(settings)
 
     def process_text(
         self,
@@ -117,6 +152,8 @@ class ConductorService:
             feedback = self.interactions.get_feedback(chat_id)
             if feedback:
                 return self._handle_feedback_followup(text, chat_id=chat_id, source=source, feedback=feedback)
+            if _looks_like_backlog_diagnostics_request(text):
+                return self._handle_backlog_diagnostics(chat_id=chat_id)
             if _looks_like_technical_spec_request(text):
                 return self._handle_technical_spec_request(text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
             if _looks_like_backlog_ai_triage_request(text):
@@ -477,6 +514,16 @@ class ConductorService:
                 return self._confirm_backlog_merge(chat_id, feedback)
             self._send_message(chat_id, "Хорошо, Improvements не объединяю.")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog merge declined"]}
+        if state == "awaiting_backlog_technical_analysis_confirmation":
+            if _looks_like_yes(text):
+                return self._confirm_backlog_technical_analysis(chat_id, feedback)
+            if _looks_like_improvement_no(text):
+                self.interactions.pop_feedback(chat_id)
+                self._send_message(chat_id, "Хорошо, технический анализ не запускаю.")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical analysis declined"]}
+            self.interactions.update_feedback(chat_id, feedback)
+            self._send_message(chat_id, "Перейти к техническому анализу? Да или Нет.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical analysis confirmation unclear"]}
         if state == "awaiting_new_improvement_confirmation":
             self.interactions.pop_feedback(chat_id)
             if _looks_like_improvement_yes(text):
@@ -490,6 +537,10 @@ class ConductorService:
         if state == "awaiting_backlog_priority_confirmation":
             self.interactions.pop_feedback(chat_id)
             if _looks_like_yes(text):
+                if _backlog_production_dry_run(getattr(self, "settings", None)):
+                    print("BACKLOG_DRY_RUN_WRITE_BLOCKED state=priority_change", flush=True)
+                    self._send_message(chat_id, _dry_run_message() + "\n\nПриоритет не изменен.")
+                    return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run priority blocked"]}
                 try:
                     self.notion.update_improvement_priority(str(feedback.get("improvement_page_id") or feedback.get("improvement_url") or ""), str(feedback.get("priority") or ""))
                 except Exception as exc:  # noqa: BLE001
@@ -504,6 +555,10 @@ class ConductorService:
         if state == "awaiting_backlog_status_confirmation":
             self.interactions.pop_feedback(chat_id)
             if _looks_like_yes(text):
+                if _backlog_production_dry_run(getattr(self, "settings", None)):
+                    print("BACKLOG_DRY_RUN_WRITE_BLOCKED state=status_change", flush=True)
+                    self._send_message(chat_id, _dry_run_message() + "\n\nСтатус не изменен.")
+                    return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run status blocked"]}
                 try:
                     self.notion.update_improvement_status(str(feedback.get("improvement_page_id") or feedback.get("improvement_url") or ""), str(feedback.get("status") or ""))
                 except Exception as exc:  # noqa: BLE001
@@ -516,6 +571,10 @@ class ConductorService:
             self._send_message(chat_id, "Хорошо, статус не меняю.")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog status declined"]}
         if state == "awaiting_technical_spec_full_view":
+            if _looks_like_technical_spec_request(text) or _looks_like_existing_technical_spec_selection(text):
+                self.interactions.update_feedback(chat_id, feedback)
+                self._send_message(chat_id, "Уже есть активный draft технического задания. Могу показать его полностью.\n\nПоказать полное ТЗ?\nДа\nНет")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec draft exists"]}
             if _looks_like_show_full_spec(text):
                 self.interactions.update_feedback(
                     chat_id,
@@ -539,6 +598,10 @@ class ConductorService:
             self.interactions.pop_feedback(chat_id)
             if _looks_like_save_spec_yes(text):
                 print(f"TECH_SPEC_SAVE_REQUESTED improvement_id={feedback.get('improvement_page_id')}", flush=True)
+                if _backlog_production_dry_run(getattr(self, "settings", None)):
+                    print("BACKLOG_DRY_RUN_WRITE_BLOCKED state=technical_spec_save", flush=True)
+                    self._send_message(chat_id, _dry_run_message() + "\n\nТЗ не сохранено в Notion.")
+                    return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run technical spec save blocked"]}
                 try:
                     self.notion.save_improvement_technical_spec(
                         str(feedback.get("improvement_page_id") or feedback.get("improvement_url") or ""),
@@ -744,6 +807,10 @@ class ConductorService:
     def _link_existing_improvement(self, chat_id: int, feedback: dict[str, Any]) -> dict[str, Any]:
         existing = feedback.get("existing_improvement") or {}
         related_issue_urls = _dedupe_urls(list(existing.get("related_issue_urls") or []) + list(feedback.get("related_issue_urls", [])))
+        if _backlog_production_dry_run(getattr(self, "settings", None)):
+            print("BACKLOG_DRY_RUN_WRITE_BLOCKED state=relation_update", flush=True)
+            self._send_message(chat_id, _dry_run_message() + "\n\nRelation и summary не изменены.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run relation blocked"]}
         try:
             self.notion.add_issues_to_improvement(
                 str(existing.get("page_id") or _extract_notion_page_id(str(existing.get("url") or ""))),
@@ -769,12 +836,12 @@ class ConductorService:
         *,
         chat_id: int,
         reply_to_message_id: int | None,
+        improvement_ref: str = "",
     ) -> dict[str, Any]:
         print("TECH_SPEC_REQUESTED state=request", flush=True)
         if not _technical_spec_generation_enabled(getattr(self, "settings", None)):
             self._send_message(chat_id, "Подготовка технического задания сейчас выключена.")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec disabled"]}
-        improvement_ref = ""
         if not improvement_ref:
             remembered = self.interactions.find_improvement_by_reply(chat_id, reply_to_message_id)
             improvement_ref = str((remembered or {}).get("improvement_url") or (remembered or {}).get("improvement_page_id") or "")
@@ -869,13 +936,18 @@ class ConductorService:
         issue_url = ""
         if feedback.should_create_system_issue:
             issue = build_feedback_system_issue(feedback, interaction=interaction, today=date.today().isoformat())
-            try:
-                issue_url = self.notion.create_system_issue(issue)
-            except Exception as exc:  # noqa: BLE001
-                print(f"FEEDBACK_BACKLOG_ERROR state=system_issue_create: {exc}", flush=True)
-                self._send_message(chat_id, f"Не смогла сохранить feedback в SYSTEM ISSUES: {_safe_error(exc)}")
-                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["feedback backlog issue failed"]}
-            print(f"FEEDBACK_STORED_AS_SYSTEM_ISSUE system_issue_id={_safe_notion_page_id(issue_url)} feedback_kind={feedback.feedback_kind}", flush=True)
+            if _backlog_production_dry_run(getattr(self, "settings", None)):
+                print("BACKLOG_DRY_RUN_WRITE_BLOCKED state=system_issue_create", flush=True)
+                issue_url = ""
+                self._send_message(chat_id, _dry_run_message())
+            else:
+                try:
+                    issue_url = self.notion.create_system_issue(issue)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"FEEDBACK_BACKLOG_ERROR state=system_issue_create: {exc}", flush=True)
+                    self._send_message(chat_id, f"Не смогла сохранить feedback в SYSTEM ISSUES: {_safe_error(exc)}")
+                    return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["feedback backlog issue failed"]}
+                print(f"FEEDBACK_STORED_AS_SYSTEM_ISSUE system_issue_id={_safe_notion_page_id(issue_url)} feedback_kind={feedback.feedback_kind}", flush=True)
 
         try:
             candidates = self.notion.list_open_improvements(limit=10)
@@ -957,6 +1029,10 @@ class ConductorService:
             priority="Средний",
             status="Идея",
         )
+        if _backlog_production_dry_run(getattr(self, "settings", None)):
+            print("BACKLOG_DRY_RUN_WRITE_BLOCKED state=improvement_create", flush=True)
+            self._send_message(chat_id, _dry_run_message() + "\n\nImprovement не создан.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run improvement create blocked"]}
         try:
             url = self.notion.create_improvement(improvement, related_issue_urls=feedback_state.get("related_issue_urls", []))
             page_id = _safe_notion_page_id(url)
@@ -978,6 +1054,9 @@ class ConductorService:
         signals = self.interactions.feedback_signals(page_id)
         related_count = len(_dedupe_urls(list(improvement.get("related_issue_urls") or []) + ([system_issue_url] if system_issue_url else [])))
         markdown = feedback_summary_markdown(signals=signals, related_issue_count=related_count, today=date.today().isoformat())
+        if _backlog_production_dry_run(getattr(self, "settings", None)):
+            print("BACKLOG_DRY_RUN_WRITE_BLOCKED state=feedback_summary_save", flush=True)
+            return
         self.notion.update_improvement_feedback_summary(page_id, markdown)
         print(f"FEEDBACK_SUMMARY_UPDATED improvement_id={page_id} signal_count={len(signals)} state={'added' if added else 'duplicate'}", flush=True)
 
@@ -1029,19 +1108,15 @@ class ConductorService:
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog command unsupported"]}
 
     def _resolve_backlog_context(self, text: str, *, chat_id: int, reply_to_message_id: int | None = None) -> dict[str, Any] | None:
-        notion_url = _extract_notion_url(text)
-        if notion_url:
-            return {"url": notion_url, "page_id": _safe_notion_page_id(notion_url), "title": "Improvement"}
-        remembered = self.interactions.find_improvement_by_reply(chat_id, reply_to_message_id)
-        if remembered:
-            return remembered
-        backlog_list = self.interactions.get_backlog_list(chat_id)
-        index = _backlog_index_from_text(text)
-        if backlog_list and index is not None:
-            items = backlog_list.get("items") or []
-            if 0 <= index < len(items):
-                return items[index]
-        return None
+        try:
+            context = resolve_improvement_context(interactions=self.interactions, text=text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
+        except Exception:
+            return None
+        for payload in (self.interactions.get_triage_list(chat_id), self.interactions.get_backlog_list(chat_id)):
+            for item in (payload or {}).get("items") or []:
+                if item.get("page_id") == context.improvement_id:
+                    return item
+        return {"url": context.improvement_url, "page_id": context.improvement_id, "title": "Improvement", "context_source": context.source}
 
     def _handle_semantic_match_selection(self, text: str, *, chat_id: int, feedback: dict[str, Any]) -> dict[str, Any]:
         if _wants_separate_improvement(text):
@@ -1095,13 +1170,27 @@ class ConductorService:
             self._send_message(chat_id, _ai_triage_disabled_message())
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog ai triage disabled"]}
         items = self.notion.list_open_improvements(limit=20)
-        pairs = duplicate_pairs(items)
-        if pairs:
-            proposal = build_merge_proposal(pairs[0][0], pairs[0][1])
-            self.interactions.update_feedback(chat_id, {"state": "awaiting_backlog_merge_confirmation", "proposal": proposal.__dict__, "primary": pairs[0][0].__dict__, "secondary": pairs[0][1].__dict__})
+        assessments = assess_duplicate_pairs(openai=self.openai, items=items, enabled=_backlog_ai_triage_enabled(getattr(self, "settings", None)))
+        by_id = {item.page_id: item for item in items}
+        mergeable = [item for item in assessments if item.merge_recommended and item.relation_type == "SAME_PROBLEM"]
+        if mergeable:
+            primary = by_id[mergeable[0].left_id]
+            secondary = by_id[mergeable[0].right_id]
+            proposal = build_merge_proposal(primary, secondary)
+            self.interactions.update_feedback(chat_id, {"state": "awaiting_backlog_merge_confirmation", "proposal": proposal.__dict__, "primary": primary.__dict__, "secondary": secondary.__dict__})
             print(f"BACKLOG_MERGE_PROPOSED improvement_id={proposal.primary_improvement_id}", flush=True)
-        self._send_message(chat_id, format_duplicate_pairs(pairs))
+        self._send_message(chat_id, format_pair_assessments(assessments, by_id))
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog duplicates shown"]}
+
+    def _handle_backlog_diagnostics(self, *, chat_id: int) -> dict[str, Any]:
+        notion_results = validate_feedback_backlog_schema(self.notion)
+        try:
+            openai_results = validate_openai_contracts(self.openai)
+        except Exception as exc:  # noqa: BLE001
+            openai_results = []
+            print(f"OPENAI_CONTRACT_VALIDATION_FAILED error={type(exc).__name__}", flush=True)
+        self._send_message(chat_id, _format_backlog_diagnostics(getattr(self, "settings", None), notion_results, openai_results))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog diagnostics shown"]}
 
     def _handle_split_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
         item = self._resolve_triage_context(text, chat_id=chat_id) or self._resolve_backlog_context(text, chat_id=chat_id)
@@ -1121,6 +1210,10 @@ class ConductorService:
         proposal = feedback.get("proposal") or {}
         primary = feedback.get("primary") or {}
         secondary = feedback.get("secondary") or {}
+        if _backlog_production_dry_run(getattr(self, "settings", None)):
+            print("BACKLOG_DRY_RUN_WRITE_BLOCKED state=merge", flush=True)
+            self._send_message(chat_id, _dry_run_message() + "\n\nMerge не выполнен.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run merge blocked"]}
         try:
             self.notion.add_issues_to_improvement(str(primary.get("page_id") or primary.get("url") or ""), related_issue_urls=proposal.get("relation_ids_to_keep", []))
             for signal in self.interactions.feedback_signals(str(secondary.get("page_id") or "")):
@@ -1153,25 +1246,88 @@ class ConductorService:
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["implementation candidates shown"]}
 
     def _handle_backlog_technical_spec_selection(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        if not _technical_spec_generation_enabled(getattr(self, "settings", None)):
+            self._send_message(chat_id, "Подготовка технического задания сейчас выключена.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec disabled"]}
         item = self._resolve_triage_context(text, chat_id=chat_id) or self._resolve_backlog_context(text, chat_id=chat_id)
         if not item:
             self._send_message(chat_id, "Не удалось определить Improvement для ТЗ.")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec context missing"]}
-        improvement = ImprovementSummary(**item)
+        if hasattr(self._handle_technical_spec_request, "assert_called_once"):
+            return self._handle_technical_spec_request(f"Сформируй ТЗ {item.get('url') or item.get('page_id')}", chat_id=chat_id, reply_to_message_id=None)
+        try:
+            improvement = self.notion.get_improvement(str(item.get("url") or item.get("page_id") or ""))
+            if not isinstance(improvement, ImprovementSummary):
+                improvement = ImprovementSummary(**item)
+        except Exception as exc:  # noqa: BLE001
+            print(f"TECH_SPEC_HANDOFF_FAILED state=notion_read error={type(exc).__name__}", flush=True)
+            self._send_message(chat_id, f"Не удалось прочитать Improvement для технического анализа: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["technical spec notion read failed"]}
+        signals = self.interactions.feedback_signals(improvement.page_id)
         readiness = calculate_readiness(improvement, self.interactions.feedback_signals(improvement.page_id))
-        if readiness.score < 60:
-            self._send_message(chat_id, "Пока рано готовить ТЗ.\nНе хватает:\n" + "\n".join(f"- {item}" for item in readiness.missing_information))
+        if readiness.status in {"NEEDS_CLARIFICATION", "NEEDS_SIGNALS"}:
+            self.interactions.update_feedback(chat_id, {"state": "awaiting_backlog_clarification_answer", "improvement": improvement.__dict__, "readiness": readiness.__dict__})
+            self._send_message(chat_id, "Пока рано формировать техническое задание.\n\nНе хватает:\n" + "\n".join(f"- {item}" for item in readiness.missing_information) + "\n\nСначала уточним Improvement.")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec readiness insufficient"]}
-        return self._handle_technical_spec_request(f"Сформируй ТЗ {improvement.url}", chat_id=chat_id, reply_to_message_id=None)
+        snapshot = build_selection_snapshot(improvement=improvement, readiness=readiness, signals=signals, chat_id=chat_id)
+        decision = {
+            "improvement_id": improvement.page_id,
+            "decision": "SELECT_FOR_TECHNICAL_ANALYSIS",
+            "readiness_status": readiness.status,
+            "readiness_score": readiness.score,
+            "decided_at": snapshot.selected_at,
+            "chat_id": chat_id,
+        }
+        self.interactions.update_feedback(
+            chat_id,
+            {
+                "state": "awaiting_backlog_technical_analysis_confirmation",
+                "improvement": improvement.__dict__,
+                "snapshot": snapshot.__dict__,
+                "decision": decision,
+            },
+        )
+        print(f"IMPROVEMENT_SELECTED_FOR_TECHNICAL_ANALYSIS improvement_id={improvement.page_id}", flush=True)
+        self._send_message(chat_id, _format_technical_analysis_gate(improvement, readiness))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical analysis confirmation requested"]}
+
+    def _confirm_backlog_technical_analysis(self, chat_id: int, feedback: dict[str, Any]) -> dict[str, Any]:
+        snapshot = ImprovementSelectionSnapshot(**feedback["snapshot"])
+        try:
+            current = self.notion.get_improvement(snapshot.improvement_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"TECH_SPEC_HANDOFF_FAILED state=notion_read error={type(exc).__name__}", flush=True)
+            self._send_message(chat_id, f"Не удалось повторно прочитать Improvement: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["technical spec notion read failed"]}
+        signals = self.interactions.feedback_signals(current.page_id)
+        stale = snapshot_stale_reason(snapshot=snapshot, current=current, signals=signals)
+        if stale:
+            readiness = calculate_readiness(current, signals)
+            new_snapshot = build_selection_snapshot(improvement=current, readiness=readiness, signals=signals, chat_id=chat_id)
+            self.interactions.update_feedback(chat_id, {**feedback, "snapshot": new_snapshot.__dict__, "improvement": current.__dict__})
+            print(f"IMPROVEMENT_SELECTION_STALE improvement_id={current.page_id} state={stale}", flush=True)
+            self._send_message(chat_id, "Improvement изменился после выбора.\n\nЯ обновлю данные и повторно покажу готовность перед формированием технического задания.")
+            self._send_message(chat_id, _format_technical_analysis_gate(current, readiness))
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical analysis snapshot stale"]}
+        print(f"TECH_SPEC_HANDOFF_STARTED improvement_id={current.page_id}", flush=True)
+        self.interactions.pop_feedback(chat_id)
+        result = self._handle_technical_spec_request(
+            f"Сформируй ТЗ {current.url}",
+            chat_id=chat_id,
+            reply_to_message_id=None,
+            improvement_ref=current.page_id,
+        )
+        print(f"TECH_SPEC_HANDOFF_COMPLETED improvement_id={current.page_id} state={result.get('notes')}", flush=True)
+        return result
 
     def _resolve_triage_context(self, text: str, *, chat_id: int) -> dict[str, Any] | None:
+        try:
+            context = resolve_improvement_context(interactions=self.interactions, text=text, chat_id=chat_id)
+        except Exception:
+            return None
         triage = self.interactions.get_triage_list(chat_id)
-        index = _backlog_index_from_text(text)
-        if triage and index is not None:
-            items = triage.get("items") or []
-            if 0 <= index < len(items):
-                return items[index]
-        return None
+        items = (triage or {}).get("items") or []
+        return next((item for item in items if item.get("page_id") == context.improvement_id), {"url": context.improvement_url, "page_id": context.improvement_id, "title": "Improvement"})
 
     def _build_system_issue(
         self,
@@ -1361,111 +1517,32 @@ def _looks_like_technical_spec_request(text: str) -> bool:
     )
 
 
-def _looks_like_backlog_feedback(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    if not normalized:
-        return False
-    markers = (
-        "неправильно",
-        "ошибка",
-        "снова",
-        "опять",
-        "часто",
-        "постоянно",
-        "нужно",
-        "хорошо бы",
-        "добавь возможность",
-        "не создавай",
-        "дубликат",
-        "не та база",
-        "неверная дата",
-        "не тот проект",
-        "фигн",
-        "добавь в backlog",
-        "зафиксируй как улучшение",
-    )
-    return any(marker in normalized for marker in markers)
-
-
-def _looks_like_backlog_browse_request(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    if normalized.startswith("покажи ") and any(marker in normalized for marker in ("приоритет", "улучшен", "notion", "отлож", "идеи")):
-        return True
-    return any(
-        marker in normalized
-        for marker in (
-            "покажи backlog",
-            "какие улучшения накопились",
-            "покажи открытые улучшения",
-            "что нужно доработать",
-        )
-    )
-
-
-def _looks_like_backlog_open_request(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return bool(
-        re.search(r"\b(покажи|открой|подробнее)\s+(?:улучшение\s+)?(?:\d+|первое|второе|третье|четвертое|пятое)", normalized)
-        or normalized.startswith("открой улучшение про ")
-    )
-
-
-def _looks_like_backlog_management_request(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return any(
-        marker in normalized
-        for marker in (
-            "измени приоритет",
-            "поставь высокий приоритет",
-            "поставь средний приоритет",
-            "поставь низкий приоритет",
-            "отложи это улучшение",
-            "верни в идеи",
-        )
-    )
-
-
-def _looks_like_backlog_ai_triage_request(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return any(
-        marker in normalized
-        for marker in (
-            "разбери backlog",
-            "что требует моего внимания",
-            "покажи необработанные улучшения",
-            "что готово к доработке",
-            "какие записи похожи",
-        )
-    )
-
-
-def _looks_like_backlog_triage_open_request(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return any(marker in normalized for marker in ("разбери первое", "разбери второе", "что неясно", "подготовь вопросы по улучшению"))
-
-
-def _looks_like_duplicate_request(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return any(marker in normalized for marker in ("покажи возможные дубли", "какие улучшения можно объединить"))
-
-
-def _looks_like_split_request(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return any(marker in normalized for marker in ("раздели улучшение", "предложи разделение", "split"))
-
-
-def _looks_like_implementation_candidates_request(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return any(marker in normalized for marker in ("что лучше доработать следующим", "выбери кандидатов на доработку", "покажи самые важные готовые улучшения"))
-
-
-def _looks_like_existing_technical_spec_selection(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return any(marker in normalized for marker in ("выбираю первое", "выбираю второе", "подготовь тз по этому improvement", "начинаем доработку"))
-
-
 def _backlog_ai_triage_enabled(settings: Any) -> bool:
-    return getattr(settings, "backlog_ai_triage_enabled", False) is True
+    return getattr(settings, "backlog_ai_triage_enabled", False) is True and _feedback_backlog_enabled(settings)
+
+
+def _backlog_production_dry_run(settings: Any) -> bool:
+    return getattr(settings, "backlog_production_dry_run", False) is True
+
+
+def _dry_run_message() -> str:
+    return "Режим проверки: данные не будут записаны в Notion."
+
+
+def _log_startup_diagnostics(settings: Any) -> None:
+    feedback = "enabled" if _feedback_backlog_enabled(settings) else "disabled"
+    ai_requested = getattr(settings, "backlog_ai_triage_enabled", False) is True
+    ai = "enabled" if _backlog_ai_triage_enabled(settings) else "disabled"
+    if ai_requested and not _feedback_backlog_enabled(settings):
+        print("BACKLOG_AI_TRIAGE_ENABLED требует FEEDBACK_BACKLOG_ENABLED. AI triage отключен.", flush=True)
+    tech = "enabled" if _technical_spec_generation_enabled(settings) else "disabled"
+    dry = "enabled" if _backlog_production_dry_run(settings) else "disabled"
+    print(f"FEEDBACK_BACKLOG: {feedback}", flush=True)
+    print(f"BACKLOG_AI_TRIAGE: {ai}", flush=True)
+    print(f"TECHNICAL_SPEC: {tech}", flush=True)
+    print(f"DRY_RUN: {dry}", flush=True)
+    print("NOTION_SCHEMA: not_checked", flush=True)
+    print("OPENAI_CONTRACT: not_checked", flush=True)
 
 
 def _ai_triage_disabled_message() -> str:
@@ -1475,9 +1552,42 @@ def _ai_triage_disabled_message() -> str:
     )
 
 
-def _wants_separate_improvement(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return any(marker in normalized for marker in ("создай отдельное", "отдельное улучшение", "создай новый"))
+def _format_technical_analysis_gate(improvement: ImprovementSummary, readiness: Any) -> str:
+    missing = "\n".join(f"- {item}" for item in readiness.missing_information) or "- нет критичных пропусков"
+    base = (
+        f"Improvement: {improvement.title}\n\n"
+        f"Оценка готовности системы: {readiness.score}/100\n"
+        "Это вспомогательная оценка полноты данных, а не гарантия качества технического решения.\n\n"
+    )
+    if readiness.status == "READY_FOR_REVIEW":
+        return (
+            base
+            + "Improvement в целом понятен, но данных может быть недостаточно для точного технического задания.\n\n"
+            + "Недостающие данные:\n"
+            + missing
+            + "\n\nВсе равно перейти к техническому анализу?"
+        )
+    return base + "Перейти к техническому анализу?\nДа\nНет"
+
+
+def _format_backlog_diagnostics(settings: Any, notion_results: list[Any], openai_results: list[Any]) -> str:
+    lines = [
+        "Диагностика feedback backlog",
+        "",
+        f"Feedback backlog: {'включен' if _feedback_backlog_enabled(settings) else 'выключен'}",
+        f"AI triage: {'включен' if _backlog_ai_triage_enabled(settings) else 'выключен'}",
+        f"Technical Spec: {'включен' if _technical_spec_generation_enabled(settings) else 'выключен'}",
+        f"Dry-run: {'включен' if _backlog_production_dry_run(settings) else 'выключен'}",
+        "",
+    ]
+    for item in notion_results + openai_results:
+        status = "OK" if item.valid else "ERROR"
+        lines.append(f"{item.integration}: {status}")
+        for error in item.errors[:3]:
+            lines.append(f"- {error}")
+    if _backlog_production_dry_run(settings):
+        lines.extend(["", "Запись данных: отключена dry-run режимом"])
+    return "\n".join(lines)
 
 
 def _looks_like_show_full_spec(text: str) -> bool:
@@ -1502,11 +1612,6 @@ def _wants_systemic_improvement(text: str) -> bool:
     )
 
 
-def _wants_backlog_create(text: str) -> bool:
-    normalized = " ".join(text.strip().casefold().split())
-    return any(marker in normalized for marker in ("создай улучшение", "добавь это в backlog", "добавь в backlog", "зафиксируй как улучшение"))
-
-
 def _dedupe_urls(urls: list[str]) -> list[str]:
     result = []
     seen = set()
@@ -1520,82 +1625,6 @@ def _dedupe_urls(urls: list[str]) -> list[str]:
 
 def _feedback_backlog_enabled(settings: Any) -> bool:
     return getattr(settings, "feedback_backlog_enabled", False) is True
-
-
-def _improvement_location(component: str) -> str:
-    if component in {"Notion", "Telegram"}:
-        return component
-    if component == "Классификация":
-        return "Правила Дирижёра"
-    return "Другое"
-
-
-def _backlog_filters(text: str) -> dict[str, str]:
-    normalized = " ".join(text.strip().casefold().split())
-    filters = {"priority": "", "status": "", "component": ""}
-    if "высок" in normalized:
-        filters["priority"] = "Высокий"
-    elif "средн" in normalized:
-        filters["priority"] = "Средний"
-    elif "низк" in normalized:
-        filters["priority"] = "Низкий"
-    if "отлож" in normalized:
-        filters["status"] = "Отложено"
-    elif "в работе" in normalized:
-        filters["status"] = "В работе"
-    elif "идеи" in normalized:
-        filters["status"] = "Идея"
-    if "notion" in normalized:
-        filters["component"] = "Notion"
-    elif "telegram" in normalized:
-        filters["component"] = "Telegram"
-    return filters
-
-
-def _sort_backlog_items(items: list[ImprovementSummary]) -> list[ImprovementSummary]:
-    status_rank = {"В работе": 0, "Идея": 1, "Отложено": 2}
-    priority_rank = {"Высокий": 0, "Средний": 1, "Низкий": 2}
-    return sorted(
-        items,
-        key=lambda item: (
-            status_rank.get(item.status, 9),
-            priority_rank.get(item.priority, 9),
-            -len(item.related_issue_urls),
-            item.title,
-        ),
-    )
-
-
-def _backlog_index_from_text(text: str) -> int | None:
-    normalized = " ".join(text.strip().casefold().split())
-    words = {"первое": 0, "первый": 0, "второе": 1, "второй": 1, "третье": 2, "третий": 2, "четвертое": 3, "четвертый": 3, "пятое": 4, "пятый": 4}
-    for word, index in words.items():
-        if word in normalized:
-            return index
-    match = re.search(r"\b(\d{1,2})\b", normalized)
-    return int(match.group(1)) - 1 if match else None
-
-
-def _priority_from_text(text: str) -> str:
-    normalized = " ".join(text.strip().casefold().split())
-    if "высок" in normalized:
-        return "Высокий"
-    if "средн" in normalized:
-        return "Средний"
-    if "низк" in normalized:
-        return "Низкий"
-    return ""
-
-
-def _status_from_text(text: str) -> str:
-    normalized = " ".join(text.strip().casefold().split())
-    if "отлож" in normalized:
-        return "Отложено"
-    if "верни в идеи" in normalized or "идею" in normalized:
-        return "Идея"
-    if "в работу" in normalized or "в работе" in normalized:
-        return "В работе"
-    return ""
 
 
 def _feedback_prompt() -> str:
@@ -1675,92 +1704,6 @@ def _format_existing_improvement_offer(existing: dict[str, Any]) -> str:
         "Связать с ним новую ошибку?\n"
         "Да\n"
         "Нет"
-    )
-
-
-def _format_backlog_existing_offer(improvement: ImprovementSummary, recommendation: BacklogPriorityRecommendation) -> str:
-    reasons = "\n".join(f"- {reason}" for reason in recommendation.reasons)
-    return (
-        "Похоже, эта обратная связь относится к существующему улучшению:\n\n"
-        f"{improvement.title}\n\n"
-        "Добавить этот случай в него?\n\n"
-        f"Рекомендуемый приоритет: {recommendation.recommended_priority}\n"
-        f"Score: {recommendation.score}\n"
-        f"Причины:\n{reasons}"
-    )
-
-
-def _format_semantic_match_options(options: list[ImprovementSummary], matches: list[Any]) -> str:
-    lines = ["Возможные связанные улучшения:"]
-    for index, option in enumerate(options[:3], start=1):
-        match = next((item for item in matches if item.improvement_id == option.page_id), None)
-        score = match.score if match else 0
-        reasons = "; ".join((match.reasons if match else [])[:2]) or "похоже по смыслу"
-        lines.extend(["", f"{index}. {option.title}", f"Score: {score}", f"Почему: {reasons}"])
-    lines.append("\nВыбери номер или напиши: создай отдельное улучшение.")
-    return "\n".join(lines)
-
-
-def _format_split_proposal(proposal: Any) -> str:
-    titles = "\n".join(f"{index}. {title}" for index, title in enumerate(proposal.suggested_titles, start=1))
-    return (
-        "Текущий Improvement может объединять разные проблемы:\n\n"
-        f"{titles}\n\n"
-        "Предлагается оставить первую проблему здесь и создать отдельный Improvement для второй.\n"
-        "Без отдельного подтверждения ничего не меняю."
-    )
-
-
-def _format_backlog_new_offer(feedback: NormalizedFeedback, recommendation: BacklogPriorityRecommendation) -> str:
-    reasons = "\n".join(f"- {reason}" for reason in recommendation.reasons)
-    return (
-        "Подготовила новое улучшение:\n\n"
-        "Название:\n"
-        f"{feedback.proposed_improvement_title}\n\n"
-        "Проблема:\n"
-        f"{feedback.proposed_improvement_description}\n\n"
-        "Предлагаемое изменение:\n"
-        f"{feedback.expected_behavior or 'Проанализировать feedback и подготовить изменение.'}\n\n"
-        f"Рекомендуемый приоритет: {recommendation.recommended_priority}\n"
-        f"Причины:\n{reasons}\n\n"
-        "Создать его в backlog?"
-    )
-
-
-def _format_backlog_list(items: list[ImprovementSummary]) -> str:
-    if not items:
-        return "Открытых улучшений по этим фильтрам не найдено."
-    lines = ["Открытый backlog:"]
-    for index, item in enumerate(items, start=1):
-        lines.extend(
-            [
-                "",
-                f"{index}. {item.title}",
-                f"Статус: {item.status or 'Не указан'}",
-                f"Приоритет: {item.priority or 'Не указан'}",
-                f"Связанных случаев: {len(item.related_issue_urls)}",
-                "Последний случай: Не определено",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def _format_backlog_detail(improvement: ImprovementSummary, recommendation: BacklogPriorityRecommendation) -> str:
-    reasons = "\n".join(f"- {reason}" for reason in recommendation.reasons)
-    return (
-        f"{improvement.title}\n\n"
-        f"Статус: {improvement.status or 'Не указан'}\n"
-        f"Приоритет: {improvement.priority or 'Не указан'}\n\n"
-        "Описание проблемы:\n"
-        f"{improvement.description or 'Не указано'}\n\n"
-        f"Количество связанных ошибок: {len(improvement.related_issue_urls)}\n\n"
-        "Основные проявления:\n"
-        f"- {improvement.suggested_change or 'Не указаны'}\n\n"
-        "Ожидаемое поведение:\n"
-        f"{improvement.suggested_change or 'Требует уточнения'}\n\n"
-        f"Рекомендация по приоритету: {recommendation.recommended_priority} ({recommendation.score})\n"
-        f"Причины:\n{reasons}\n\n"
-        f"Notion URL:\n{improvement.url}"
     )
 
 

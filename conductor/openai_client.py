@@ -24,6 +24,7 @@ from .models import (
     SYSTEM_ISSUE_TYPES,
     Classification,
     FeedbackEnrichment,
+    ImprovementPairAssessment,
     IssueRecurrenceAnalysis,
     ImprovementSummary,
     ImprovementMatchCandidate,
@@ -33,6 +34,7 @@ from .models import (
     classification_from_dict,
     feedback_enrichment_from_dict,
     improvement_match_candidate_from_dict,
+    improvement_pair_assessment_from_dict,
     issue_recurrence_analysis_from_dict,
     system_issue_classification_from_dict,
     technical_change_proposal_from_dict,
@@ -363,6 +365,32 @@ IMPROVEMENT_MATCH_SCHEMA: dict[str, Any] = {
         }
     },
     "required": ["candidates"],
+}
+
+
+IMPROVEMENT_PAIR_ASSESSMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "pairs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "left_id": {"type": "string"},
+                    "right_id": {"type": "string"},
+                    "relation_type": {"type": "string", "enum": ["SAME_PROBLEM", "OVERLAPPING", "RELATED_BUT_DISTINCT", "NOT_RELATED"]},
+                    "score": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "shared_problem": {"type": "string"},
+                    "differences": {"type": "array", "items": {"type": "string"}},
+                    "merge_recommended": {"type": "boolean"},
+                },
+                "required": ["left_id", "right_id", "relation_type", "score", "shared_problem", "differences", "merge_recommended"],
+            },
+        }
+    },
+    "required": ["pairs"],
 }
 
 
@@ -736,6 +764,40 @@ class OpenAIClient:
         )
         raw = json.loads(_extract_response_text(data))
         return [improvement_match_candidate_from_dict(item) for item in raw.get("candidates", [])]
+
+    def assess_improvement_pairs(self, *, pairs: list[dict[str, Any]]) -> list[ImprovementPairAssessment]:
+        if not self.api_key:
+            raise RuntimeError("AI-анализ недоступен")
+        payload = {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Сравни пары Improvements. SAME_PROBLEM только если это одна проблема и одно ожидаемое изменение. "
+                        "Даже при высокой уверенности возвращай только рекомендацию, без команды merge."
+                    ),
+                },
+                {"role": "user", "content": json.dumps({"pairs": pairs[:30]}, ensure_ascii=False)},
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "conductor_improvement_pair_assessment",
+                    "schema": IMPROVEMENT_PAIR_ASSESSMENT_SCHEMA,
+                    "strict": True,
+                }
+            },
+        }
+        data = request_json(
+            "POST",
+            "https://api.openai.com/v1/responses",
+            headers={**self.headers, "Content-Type": "application/json"},
+            payload=payload,
+            timeout=90,
+        )
+        raw = json.loads(_extract_response_text(data))
+        return [improvement_pair_assessment_from_dict(item) for item in raw.get("pairs", [])]
 
     def _transcription_models(self) -> list[str]:
         models = [self.transcribe_model]
