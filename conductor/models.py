@@ -202,6 +202,9 @@ class ImprovementSummary:
     improvement_type: str
     change_location: str
     related_issue_urls: list[str] = field(default_factory=list)
+    priority: str = ""
+    description: str = ""
+    suggested_change: str = ""
 
 
 @dataclass
@@ -237,6 +240,36 @@ class TechnicalChangeProposal:
     risks: list[str]
     open_questions: list[str]
     confidence: float
+
+
+@dataclass
+class NormalizedFeedback:
+    feedback_kind: str
+    normalized_title: str
+    normalized_description: str
+    original_text: str
+    actual_behavior: str
+    expected_behavior: str
+    affected_entity_type: str
+    affected_database: str
+    affected_component: str
+    severity: str
+    is_recurring_statement: bool
+    needs_interaction_context: bool
+    should_create_system_issue: bool
+    should_find_or_create_improvement: bool
+    proposed_improvement_title: str
+    proposed_improvement_description: str
+    confidence: float
+    needs_clarification: bool
+    clarification_question: str
+
+
+@dataclass
+class BacklogPriorityRecommendation:
+    recommended_priority: str
+    score: int
+    reasons: list[str]
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:

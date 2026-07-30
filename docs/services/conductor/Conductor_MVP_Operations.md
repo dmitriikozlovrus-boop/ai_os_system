@@ -52,6 +52,7 @@ conductor/
 - создание записей в Notion `GOODS`;
 - локальное хранение ожидающих уточнений в `data/pending.json`;
 - формирование черновика технического задания из `IMPROVEMENTS` при отдельном feature flag;
+- нормализацию пользовательского feedback в backlog при отдельном feature flag;
 - полную двустороннюю синхронизацию базы `TASKS` и Todoist.
 
 ## Быстрый старт
@@ -119,6 +120,7 @@ python3 -m conductor.cli "Завтра напомни написать Марк�
 - Todoist включается при наличии `TODOIST_API_TOKEN`;
 - аварийная пауза Todoist sync управляется только переменной `TODOIST_SYNC_PAUSED`.
 - генерация технического задания из Improvement выключена по умолчанию и управляется `TECHNICAL_SPEC_GENERATION_ENABLED`.
+- накопительный backlog feedback выключен по умолчанию и управляется `FEEDBACK_BACKLOG_ENABLED`.
 
 ## Improvement → Codex Task
 
@@ -144,6 +146,33 @@ Feature flag:
 
 ```bash
 TECHNICAL_SPEC_GENERATION_ENABLED=false
+```
+
+## Telegram Feedback → Backlog
+
+Сценарий нормализации feedback описан отдельно:
+
+```text
+docs/product/use_cases/UC_005_Telegram_Feedback_To_Backlog.md
+```
+
+Операционные правила:
+
+- `FEEDBACK_BACKLOG_ENABLED=false` — значение по умолчанию;
+- correction flow, System Issues, existing Improvement flow и Technical Spec flow продолжают работать при выключенном флаге;
+- Conductor сохраняет исходный feedback и отдельно формирует нейтральное описание;
+- конкретная ошибка может создать `SYSTEM ISSUES`;
+- общая проблема или идея может попасть в `IMPROVEMENTS` без конкретного interaction;
+- сначала ищется существующий открытый Improvement, затем предлагается новый;
+- связь с существующим Improvement и создание нового Improvement требуют пользовательского подтверждения, кроме явной команды `Добавь в backlog`;
+- summary обновляется только в managed section `CONDUCTOR_FEEDBACK_SUMMARY_START/END`;
+- изменение приоритета или статуса Improvement требует отдельного подтверждения;
+- runtime не запускает Codex и не создает GitHub branch, commit, push или PR.
+
+Feature flag:
+
+```bash
+FEEDBACK_BACKLOG_ENABLED=false
 ```
 
 ## TASKS ↔ Todoist
@@ -352,6 +381,8 @@ NOTION_SYSTEM_ISSUES_DATABASE_ID
 NOTION_IMPROVEMENTS_DATABASE_ID
 NOTION_PROJECTS_DATABASE_ID
 SYSTEM_IMPROVEMENTS_ENABLED
+TECHNICAL_SPEC_GENERATION_ENABLED
+FEEDBACK_BACKLOG_ENABLED
 TODOIST_API_TOKEN
 TODOIST_WEBHOOK_SECRET
 TASK_SYNC_SECRET
@@ -535,11 +566,15 @@ SYSTEM_IMPROVEMENTS_ENABLED=false
 
 `SYSTEM_IMPROVEMENTS_ENABLED=true` включает поиск повторяемости, предложение Improvement и создание записи после подтверждения пользователя. Если `NOTION_IMPROVEMENTS_DATABASE_ID` не задан, flow завершается контролируемо и пишет технический лог без блокировки сохранения System Issue.
 
+`FEEDBACK_BACKLOG_ENABLED=false` — безопасный режим по умолчанию. В нем normalization, накопительная summary и browsing backlog через Telegram не запускаются.
+
+`FEEDBACK_BACKLOG_ENABLED=true` включает fallback-нормализацию feedback, поиск существующего Improvement, предложение backlog item, managed summary и Telegram-команды просмотра backlog.
+
 Ограничения MVP:
 
 - нет автоматического удаления или архивирования ошибочных исходных записей;
 - нет самообучения правил;
-- пользовательский feedback не дедуплицируется по fingerprint;
+- одинаковые backlog signals дедуплицируются по тексту в течение 7 дней;
 - технические ошибки дедуплицируются по fingerprint в течение 7 дней;
 - feedback state живет 24 часа.
 

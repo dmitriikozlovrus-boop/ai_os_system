@@ -7,13 +7,23 @@ from datetime import date
 from typing import Any
 
 from .config import Settings
+from .feedback_backlog import (
+    build_feedback_system_issue,
+    choose_matching_improvement,
+    feedback_summary_markdown,
+    normalize_feedback,
+    priority_recommendation,
+    signal_payload,
+)
 from .interactions import InteractionStore
 from .models import (
+    BacklogPriorityRecommendation,
     Classification,
     GoodsItem,
     ImprovementRecord,
     ImprovementSummary,
     IssueRecurrenceAnalysis,
+    NormalizedFeedback,
     StudyItem,
     SystemIssueRecord,
     TaskItem,
@@ -94,6 +104,12 @@ class ConductorService:
                 return self._handle_feedback_followup(text, chat_id=chat_id, source=source, feedback=feedback)
             if _looks_like_technical_spec_request(text):
                 return self._handle_technical_spec_request(text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
+            if _feedback_backlog_enabled(getattr(self, "settings", None)) and _looks_like_backlog_browse_request(text):
+                return self._handle_backlog_browse_request(text, chat_id=chat_id)
+            if _feedback_backlog_enabled(getattr(self, "settings", None)) and _looks_like_backlog_open_request(text):
+                return self._handle_backlog_open_request(text, chat_id=chat_id)
+            if _feedback_backlog_enabled(getattr(self, "settings", None)) and _looks_like_backlog_management_request(text):
+                return self._handle_backlog_management_request(text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
             reply_interaction = self.interactions.find_by_reply(chat_id, reply_to_message_id)
             latest_interaction = self.interactions.latest_for_chat(chat_id)
             if reply_interaction and _looks_like_feedback(text, has_context=True, is_reply=True):
@@ -105,6 +121,8 @@ class ConductorService:
                     command=text,
                 )
             if _looks_like_feedback_command(text):
+                if _feedback_backlog_enabled(getattr(self, "settings", None)):
+                    return self._handle_normalized_feedback(text, chat_id=chat_id, source=source, reply_to_message_id=reply_to_message_id)
                 return self._start_feedback_flow(text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
             if _looks_like_feedback(text, has_context=bool(latest_interaction), is_reply=False):
                 if latest_interaction:
@@ -116,6 +134,8 @@ class ConductorService:
                         command=text,
                     )
                 return self._start_feedback_flow(text, chat_id=chat_id, reply_to_message_id=None, no_context=True)
+            if _feedback_backlog_enabled(getattr(self, "settings", None)) and _looks_like_backlog_feedback(text):
+                return self._handle_normalized_feedback(text, chat_id=chat_id, source=source, reply_to_message_id=reply_to_message_id)
 
         interaction_id = None
         if chat_id is not None and hasattr(self, "interactions"):
@@ -405,6 +425,48 @@ class ConductorService:
         feedback: dict[str, Any],
     ) -> dict[str, Any]:
         state = feedback.get("state")
+        if state == "awaiting_feedback_clarification":
+            self.interactions.pop_feedback(chat_id)
+            merged = f"{feedback.get('command') or ''}\n{text}".strip()
+            return self._handle_normalized_feedback(merged, chat_id=chat_id, source=source, reply_to_message_id=None)
+        if state == "awaiting_new_improvement_confirmation":
+            self.interactions.pop_feedback(chat_id)
+            if _looks_like_improvement_yes(text):
+                return self._create_backlog_improvement(chat_id, feedback)
+            if _looks_like_improvement_no(text):
+                self._send_message(chat_id, "Хорошо, новое Improvement не создаю.")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog improvement declined"]}
+            self.interactions.update_feedback(chat_id, feedback)
+            self._send_message(chat_id, "Создать это улучшение в backlog? Да или Нет.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog improvement confirmation unclear"]}
+        if state == "awaiting_backlog_priority_confirmation":
+            self.interactions.pop_feedback(chat_id)
+            if _looks_like_yes(text):
+                try:
+                    self.notion.update_improvement_priority(str(feedback.get("improvement_page_id") or feedback.get("improvement_url") or ""), str(feedback.get("priority") or ""))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"FEEDBACK_BACKLOG_ERROR state=priority_change improvement_id={feedback.get('improvement_page_id')}: {exc}", flush=True)
+                    self._send_message(chat_id, f"Не смогла изменить приоритет: {_safe_error(exc)}")
+                    return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["backlog priority failed"]}
+                print(f"BACKLOG_PRIORITY_CHANGED improvement_id={feedback.get('improvement_page_id')} state=changed", flush=True)
+                self._send_message(chat_id, "Приоритет Improvement изменен.")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog priority changed"]}
+            self._send_message(chat_id, "Хорошо, приоритет не меняю.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog priority declined"]}
+        if state == "awaiting_backlog_status_confirmation":
+            self.interactions.pop_feedback(chat_id)
+            if _looks_like_yes(text):
+                try:
+                    self.notion.update_improvement_status(str(feedback.get("improvement_page_id") or feedback.get("improvement_url") or ""), str(feedback.get("status") or ""))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"FEEDBACK_BACKLOG_ERROR state=status_change improvement_id={feedback.get('improvement_page_id')}: {exc}", flush=True)
+                    self._send_message(chat_id, f"Не смогла изменить статус: {_safe_error(exc)}")
+                    return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["backlog status failed"]}
+                print(f"BACKLOG_STATUS_CHANGED improvement_id={feedback.get('improvement_page_id')} state=changed", flush=True)
+                self._send_message(chat_id, "Статус Improvement изменен.")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog status changed"]}
+            self._send_message(chat_id, "Хорошо, статус не меняю.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog status declined"]}
         if state == "awaiting_technical_spec_full_view":
             if _looks_like_show_full_spec(text):
                 self.interactions.update_feedback(
@@ -639,6 +701,12 @@ class ConductorService:
                 str(existing.get("page_id") or _extract_notion_page_id(str(existing.get("url") or ""))),
                 related_issue_urls=related_issue_urls,
             )
+            if feedback.get("normalized_feedback"):
+                self._update_backlog_summary_for_feedback(
+                    existing,
+                    NormalizedFeedback(**feedback["normalized_feedback"]),
+                    system_issue_url=str(feedback.get("system_issue_url") or ""),
+                )
         except Exception as exc:  # noqa: BLE001
             print(f"IMPROVEMENT_LINK_ERROR: {exc}", flush=True)
             self._send_message(chat_id, f"Не смогла связать Improvement с ошибкой: {_safe_error(exc)}")
@@ -715,6 +783,181 @@ class ConductorService:
         print(f"TECH_SPEC_GENERATED improvement_id={improvement.page_id} proposal_confidence={proposal.confidence}", flush=True)
         self._send_message(chat_id, _format_technical_spec_preview(proposal))
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["technical spec preview"], "proposal": proposal.__dict__}
+
+    def _handle_normalized_feedback(
+        self,
+        text: str,
+        *,
+        chat_id: int,
+        source: str,
+        reply_to_message_id: int | None,
+    ) -> dict[str, Any]:
+        print("FEEDBACK_NORMALIZATION_STARTED state=start", flush=True)
+        interaction = self.interactions.find_by_reply(chat_id, reply_to_message_id) or self.interactions.latest_for_chat(chat_id)
+        feedback = normalize_feedback(text, interaction=interaction)
+        print(f"FEEDBACK_NORMALIZED feedback_kind={feedback.feedback_kind} confidence={feedback.confidence:.2f}", flush=True)
+        if feedback.feedback_kind == "CORRECTION" and interaction:
+            return self._capture_feedback(text, chat_id=chat_id, source=source, interaction=interaction, command=text)
+        if feedback.needs_clarification:
+            self.interactions.update_feedback(
+                chat_id,
+                {
+                    "state": "awaiting_feedback_clarification",
+                    "command": text,
+                    "normalized_feedback": feedback.__dict__,
+                },
+            )
+            print(f"FEEDBACK_CLARIFICATION_REQUIRED feedback_kind={feedback.feedback_kind} state=awaiting_feedback_clarification", flush=True)
+            self._send_message(chat_id, feedback.clarification_question)
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback clarification requested"]}
+        if not feedback.should_find_or_create_improvement and not feedback.should_create_system_issue:
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["not feedback"]}
+
+        issue_url = ""
+        if feedback.should_create_system_issue:
+            issue = build_feedback_system_issue(feedback, interaction=interaction, today=date.today().isoformat())
+            try:
+                issue_url = self.notion.create_system_issue(issue)
+            except Exception as exc:  # noqa: BLE001
+                print(f"FEEDBACK_BACKLOG_ERROR state=system_issue_create: {exc}", flush=True)
+                self._send_message(chat_id, f"Не смогла сохранить feedback в SYSTEM ISSUES: {_safe_error(exc)}")
+                return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["feedback backlog issue failed"]}
+            print(f"FEEDBACK_STORED_AS_SYSTEM_ISSUE system_issue_id={_safe_notion_page_id(issue_url)} feedback_kind={feedback.feedback_kind}", flush=True)
+
+        try:
+            candidates = self.notion.list_open_improvements(limit=20)
+        except Exception as exc:  # noqa: BLE001
+            print(f"FEEDBACK_BACKLOG_ERROR state=improvement_search: {exc}", flush=True)
+            candidates = []
+        match = choose_matching_improvement(candidates, feedback)
+        recommendation = priority_recommendation(feedback=feedback, signal_count=(len(match.related_issue_urls) + 1 if match else 1), explicit_request=_wants_backlog_create(text))
+        if match:
+            print(f"FEEDBACK_MATCHED_TO_IMPROVEMENT improvement_id={match.page_id} candidate_count={len(candidates)}", flush=True)
+            payload = {
+                "state": "awaiting_existing_improvement_link_confirmation",
+                "system_issue_url": issue_url,
+                "related_issue_urls": _dedupe_urls([*(match.related_issue_urls or []), issue_url]),
+                "existing_improvement": match.__dict__,
+                "normalized_feedback": feedback.__dict__,
+                "priority_recommendation": recommendation.__dict__,
+                "analysis": {},
+            }
+            self.interactions.update_feedback(chat_id, payload)
+            self._send_message(chat_id, _format_backlog_existing_offer(match, recommendation))
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback matched improvement"], "issue_url": issue_url}
+
+        payload = {
+            "state": "awaiting_new_improvement_confirmation",
+            "system_issue_url": issue_url,
+            "related_issue_urls": [issue_url] if issue_url else [],
+            "normalized_feedback": feedback.__dict__,
+            "priority_recommendation": recommendation.__dict__,
+        }
+        if _wants_backlog_create(text):
+            self.interactions.update_feedback(chat_id, payload)
+            return self._create_backlog_improvement(chat_id, payload)
+        self.interactions.update_feedback(chat_id, payload)
+        print(f"FEEDBACK_NEW_IMPROVEMENT_PROPOSED feedback_kind={feedback.feedback_kind} state=awaiting_new_improvement_confirmation", flush=True)
+        self._send_message(chat_id, _format_backlog_new_offer(feedback, recommendation))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback new improvement proposed"], "issue_url": issue_url}
+
+    def _create_backlog_improvement(self, chat_id: int, feedback_state: dict[str, Any]) -> dict[str, Any]:
+        feedback = NormalizedFeedback(**feedback_state["normalized_feedback"])
+        recommendation = BacklogPriorityRecommendation(**feedback_state.get("priority_recommendation", {"recommended_priority": "Средний", "score": 40, "reasons": []}))
+        improvement = ImprovementRecord(
+            title=feedback.proposed_improvement_title,
+            description=feedback.proposed_improvement_description,
+            suggested_change=feedback.expected_behavior or "Проанализировать накопленный feedback и подготовить изменение.",
+            improvement_type="Правило" if feedback.affected_component == "Классификация" else "Автоматизация",
+            change_location=_improvement_location(feedback.affected_component),
+            priority="Средний",
+            status="Идея",
+        )
+        try:
+            url = self.notion.create_improvement(improvement, related_issue_urls=feedback_state.get("related_issue_urls", []))
+            page_id = _safe_notion_page_id(url)
+            self._update_backlog_summary_for_feedback({"page_id": page_id, "url": url, "related_issue_urls": feedback_state.get("related_issue_urls", [])}, feedback, system_issue_url=str(feedback_state.get("system_issue_url") or ""))
+        except Exception as exc:  # noqa: BLE001
+            print(f"FEEDBACK_BACKLOG_ERROR state=improvement_create: {exc}", flush=True)
+            self._send_message(chat_id, f"Не смогла создать Improvement: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["backlog improvement create failed"]}
+        print(f"FEEDBACK_LINKED_TO_IMPROVEMENT improvement_id={page_id} state=created", flush=True)
+        self._send_message(chat_id, f"Improvement добавлен в backlog:\n{url}\n\nРекомендуемый приоритет: {recommendation.recommended_priority}. Реальный приоритет оставлен: Средний.")
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog improvement created"], "improvement_url": url}
+
+    def _update_backlog_summary_for_feedback(self, improvement: dict[str, Any], feedback: NormalizedFeedback, *, system_issue_url: str = "") -> None:
+        page_id = str(improvement.get("page_id") or _safe_notion_page_id(str(improvement.get("url") or "")))
+        if not page_id:
+            raise RuntimeError("Improvement page id is required")
+        signal = signal_payload(feedback, today=date.today().isoformat(), system_issue_url=system_issue_url)
+        added = self.interactions.remember_feedback_signal(page_id, signal)
+        signals = self.interactions.feedback_signals(page_id)
+        related_count = len(_dedupe_urls(list(improvement.get("related_issue_urls") or []) + ([system_issue_url] if system_issue_url else [])))
+        markdown = feedback_summary_markdown(signals=signals, related_issue_count=related_count, today=date.today().isoformat())
+        self.notion.update_improvement_feedback_summary(page_id, markdown)
+        print(f"FEEDBACK_SUMMARY_UPDATED improvement_id={page_id} signal_count={len(signals)} state={'added' if added else 'duplicate'}", flush=True)
+
+    def _handle_backlog_browse_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        print("BACKLOG_LIST_REQUESTED state=request", flush=True)
+        filters = _backlog_filters(text)
+        try:
+            items = self.notion.list_open_improvements(limit=10, **filters)
+        except Exception as exc:  # noqa: BLE001
+            print(f"FEEDBACK_BACKLOG_ERROR state=list: {exc}", flush=True)
+            self._send_message(chat_id, f"Не смогла загрузить backlog: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["backlog list failed"]}
+        items = _sort_backlog_items(items)[:10]
+        self.interactions.remember_backlog_list(chat_id, [item.__dict__ for item in items])
+        print(f"BACKLOG_LIST_SHOWN candidate_count={len(items)}", flush=True)
+        self._send_message(chat_id, _format_backlog_list(items))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog list shown"], "count": len(items)}
+
+    def _handle_backlog_open_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
+        item = self._resolve_backlog_context(text, chat_id=chat_id)
+        if not item:
+            self._send_message(chat_id, "Не удалось определить Improvement. Сначала покажи backlog или пришли ссылку Notion.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog context missing"]}
+        try:
+            improvement = self.notion.get_improvement(str(item.get("url") or item.get("page_id") or ""))
+        except Exception:
+            improvement = ImprovementSummary(**item)
+        recommendation = priority_recommendation(feedback=normalize_feedback(improvement.title), signal_count=len(improvement.related_issue_urls))
+        print(f"BACKLOG_ITEM_OPENED improvement_id={improvement.page_id}", flush=True)
+        self._send_message(chat_id, _format_backlog_detail(improvement, recommendation))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog item opened"]}
+
+    def _handle_backlog_management_request(self, text: str, *, chat_id: int, reply_to_message_id: int | None) -> dict[str, Any]:
+        item = self._resolve_backlog_context(text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
+        if not item:
+            self._send_message(chat_id, "Не удалось определить Improvement для изменения.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog context missing"]}
+        priority = _priority_from_text(text)
+        status = _status_from_text(text)
+        if priority:
+            self.interactions.update_feedback(chat_id, {"state": "awaiting_backlog_priority_confirmation", "improvement_page_id": item.get("page_id"), "improvement_url": item.get("url"), "priority": priority})
+            self._send_message(chat_id, f"Изменить приоритет Improvement\n«{item.get('title') or 'Без названия'}»\nна «{priority}»?")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog priority confirmation requested"]}
+        if status:
+            self.interactions.update_feedback(chat_id, {"state": "awaiting_backlog_status_confirmation", "improvement_page_id": item.get("page_id"), "improvement_url": item.get("url"), "status": status})
+            self._send_message(chat_id, f"Изменить статус Improvement\n«{item.get('title') or 'Без названия'}»\nна «{status}»?")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog status confirmation requested"]}
+        self._send_message(chat_id, "Пока поддержаны только изменение приоритета и статуса.")
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["backlog command unsupported"]}
+
+    def _resolve_backlog_context(self, text: str, *, chat_id: int, reply_to_message_id: int | None = None) -> dict[str, Any] | None:
+        notion_url = _extract_notion_url(text)
+        if notion_url:
+            return {"url": notion_url, "page_id": _safe_notion_page_id(notion_url), "title": "Improvement"}
+        remembered = self.interactions.find_improvement_by_reply(chat_id, reply_to_message_id)
+        if remembered:
+            return remembered
+        backlog_list = self.interactions.get_backlog_list(chat_id)
+        index = _backlog_index_from_text(text)
+        if backlog_list and index is not None:
+            items = backlog_list.get("items") or []
+            if 0 <= index < len(items):
+                return items[index]
+        return None
 
     def _build_system_issue(
         self,
@@ -904,6 +1147,70 @@ def _looks_like_technical_spec_request(text: str) -> bool:
     )
 
 
+def _looks_like_backlog_feedback(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    if not normalized:
+        return False
+    markers = (
+        "неправильно",
+        "ошибка",
+        "снова",
+        "опять",
+        "часто",
+        "постоянно",
+        "нужно",
+        "хорошо бы",
+        "добавь возможность",
+        "не создавай",
+        "дубликат",
+        "не та база",
+        "неверная дата",
+        "не тот проект",
+        "фигн",
+        "добавь в backlog",
+        "зафиксируй как улучшение",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _looks_like_backlog_browse_request(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    if normalized.startswith("покажи ") and any(marker in normalized for marker in ("приоритет", "улучшен", "notion", "отлож", "идеи")):
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "покажи backlog",
+            "какие улучшения накопились",
+            "покажи открытые улучшения",
+            "что нужно доработать",
+        )
+    )
+
+
+def _looks_like_backlog_open_request(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return bool(
+        re.search(r"\b(покажи|открой|подробнее)\s+(?:улучшение\s+)?(?:\d+|первое|второе|третье|четвертое|пятое)", normalized)
+        or normalized.startswith("открой улучшение про ")
+    )
+
+
+def _looks_like_backlog_management_request(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(
+        marker in normalized
+        for marker in (
+            "измени приоритет",
+            "поставь высокий приоритет",
+            "поставь средний приоритет",
+            "поставь низкий приоритет",
+            "отложи это улучшение",
+            "верни в идеи",
+        )
+    )
+
+
 def _looks_like_show_full_spec(text: str) -> bool:
     return text.strip().casefold() in {"да", "покажи", "покажи полностью", "yes", "y"}
 
@@ -926,6 +1233,11 @@ def _wants_systemic_improvement(text: str) -> bool:
     )
 
 
+def _wants_backlog_create(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    return any(marker in normalized for marker in ("создай улучшение", "добавь это в backlog", "добавь в backlog", "зафиксируй как улучшение"))
+
+
 def _dedupe_urls(urls: list[str]) -> list[str]:
     result = []
     seen = set()
@@ -935,6 +1247,86 @@ def _dedupe_urls(urls: list[str]) -> list[str]:
         seen.add(url)
         result.append(url)
     return result
+
+
+def _feedback_backlog_enabled(settings: Any) -> bool:
+    return getattr(settings, "feedback_backlog_enabled", False) is True
+
+
+def _improvement_location(component: str) -> str:
+    if component in {"Notion", "Telegram"}:
+        return component
+    if component == "Классификация":
+        return "Правила Дирижёра"
+    return "Другое"
+
+
+def _backlog_filters(text: str) -> dict[str, str]:
+    normalized = " ".join(text.strip().casefold().split())
+    filters = {"priority": "", "status": "", "component": ""}
+    if "высок" in normalized:
+        filters["priority"] = "Высокий"
+    elif "средн" in normalized:
+        filters["priority"] = "Средний"
+    elif "низк" in normalized:
+        filters["priority"] = "Низкий"
+    if "отлож" in normalized:
+        filters["status"] = "Отложено"
+    elif "в работе" in normalized:
+        filters["status"] = "В работе"
+    elif "идеи" in normalized:
+        filters["status"] = "Идея"
+    if "notion" in normalized:
+        filters["component"] = "Notion"
+    elif "telegram" in normalized:
+        filters["component"] = "Telegram"
+    return filters
+
+
+def _sort_backlog_items(items: list[ImprovementSummary]) -> list[ImprovementSummary]:
+    status_rank = {"В работе": 0, "Идея": 1, "Отложено": 2}
+    priority_rank = {"Высокий": 0, "Средний": 1, "Низкий": 2}
+    return sorted(
+        items,
+        key=lambda item: (
+            status_rank.get(item.status, 9),
+            priority_rank.get(item.priority, 9),
+            -len(item.related_issue_urls),
+            item.title,
+        ),
+    )
+
+
+def _backlog_index_from_text(text: str) -> int | None:
+    normalized = " ".join(text.strip().casefold().split())
+    words = {"первое": 0, "первый": 0, "второе": 1, "второй": 1, "третье": 2, "третий": 2, "четвертое": 3, "четвертый": 3, "пятое": 4, "пятый": 4}
+    for word, index in words.items():
+        if word in normalized:
+            return index
+    match = re.search(r"\b(\d{1,2})\b", normalized)
+    return int(match.group(1)) - 1 if match else None
+
+
+def _priority_from_text(text: str) -> str:
+    normalized = " ".join(text.strip().casefold().split())
+    if "высок" in normalized:
+        return "Высокий"
+    if "средн" in normalized:
+        return "Средний"
+    if "низк" in normalized:
+        return "Низкий"
+    return ""
+
+
+def _status_from_text(text: str) -> str:
+    normalized = " ".join(text.strip().casefold().split())
+    if "отлож" in normalized:
+        return "Отложено"
+    if "верни в идеи" in normalized or "идею" in normalized:
+        return "Идея"
+    if "в работу" in normalized or "в работе" in normalized:
+        return "В работе"
+    return ""
 
 
 def _feedback_prompt() -> str:
@@ -1014,6 +1406,71 @@ def _format_existing_improvement_offer(existing: dict[str, Any]) -> str:
         "Связать с ним новую ошибку?\n"
         "Да\n"
         "Нет"
+    )
+
+
+def _format_backlog_existing_offer(improvement: ImprovementSummary, recommendation: BacklogPriorityRecommendation) -> str:
+    reasons = "\n".join(f"- {reason}" for reason in recommendation.reasons)
+    return (
+        "Похоже, эта обратная связь относится к существующему улучшению:\n\n"
+        f"{improvement.title}\n\n"
+        "Добавить этот случай в него?\n\n"
+        f"Рекомендуемый приоритет: {recommendation.recommended_priority}\n"
+        f"Score: {recommendation.score}\n"
+        f"Причины:\n{reasons}"
+    )
+
+
+def _format_backlog_new_offer(feedback: NormalizedFeedback, recommendation: BacklogPriorityRecommendation) -> str:
+    reasons = "\n".join(f"- {reason}" for reason in recommendation.reasons)
+    return (
+        "Подготовила новое улучшение:\n\n"
+        "Название:\n"
+        f"{feedback.proposed_improvement_title}\n\n"
+        "Проблема:\n"
+        f"{feedback.proposed_improvement_description}\n\n"
+        "Предлагаемое изменение:\n"
+        f"{feedback.expected_behavior or 'Проанализировать feedback и подготовить изменение.'}\n\n"
+        f"Рекомендуемый приоритет: {recommendation.recommended_priority}\n"
+        f"Причины:\n{reasons}\n\n"
+        "Создать его в backlog?"
+    )
+
+
+def _format_backlog_list(items: list[ImprovementSummary]) -> str:
+    if not items:
+        return "Открытых улучшений по этим фильтрам не найдено."
+    lines = ["Открытый backlog:"]
+    for index, item in enumerate(items, start=1):
+        lines.extend(
+            [
+                "",
+                f"{index}. {item.title}",
+                f"Статус: {item.status or 'Не указан'}",
+                f"Приоритет: {item.priority or 'Не указан'}",
+                f"Связанных случаев: {len(item.related_issue_urls)}",
+                "Последний случай: Не определено",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _format_backlog_detail(improvement: ImprovementSummary, recommendation: BacklogPriorityRecommendation) -> str:
+    reasons = "\n".join(f"- {reason}" for reason in recommendation.reasons)
+    return (
+        f"{improvement.title}\n\n"
+        f"Статус: {improvement.status or 'Не указан'}\n"
+        f"Приоритет: {improvement.priority or 'Не указан'}\n\n"
+        "Описание проблемы:\n"
+        f"{improvement.description or 'Не указано'}\n\n"
+        f"Количество связанных ошибок: {len(improvement.related_issue_urls)}\n\n"
+        "Основные проявления:\n"
+        f"- {improvement.suggested_change or 'Не указаны'}\n\n"
+        "Ожидаемое поведение:\n"
+        f"{improvement.suggested_change or 'Требует уточнения'}\n\n"
+        f"Рекомендация по приоритету: {recommendation.recommended_priority} ({recommendation.score})\n"
+        f"Причины:\n{reasons}\n\n"
+        f"Notion URL:\n{improvement.url}"
     )
 
 

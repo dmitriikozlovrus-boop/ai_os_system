@@ -163,6 +163,48 @@ class InteractionStore:
         values = [raw] if isinstance(raw, dict) else raw
         return [item for item in values if isinstance(item, dict) and not _expired(item.get("timestamp"), FEEDBACK_TTL)]
 
+    def remember_backlog_list(self, chat_id: int, improvements: list[dict[str, Any]]) -> None:
+        data = self._load()
+        data.setdefault("_backlog_lists", {})[str(chat_id)] = {
+            "chat_id": chat_id,
+            "items": improvements,
+            "timestamp": _now(),
+        }
+        self._save(data)
+
+    def get_backlog_list(self, chat_id: int) -> dict[str, Any] | None:
+        data = self._load()
+        payload = data.get("_backlog_lists", {}).get(str(chat_id))
+        if not payload:
+            return None
+        if _expired(payload.get("timestamp"), FEEDBACK_TTL):
+            data.get("_backlog_lists", {}).pop(str(chat_id), None)
+            self._save(data)
+            return None
+        return payload
+
+    def remember_feedback_signal(self, improvement_id: str, signal: dict[str, Any]) -> bool:
+        data = self._load()
+        signals = data.setdefault("_feedback_signals", {}).setdefault(improvement_id, [])
+        self._prune_feedback_signals(signals)
+        normalized = _normalized_signal_text(signal.get("original"))
+        if normalized and any(_normalized_signal_text(item.get("original")) == normalized for item in signals):
+            self._save(data)
+            return False
+        payload = dict(signal)
+        payload.setdefault("timestamp", _now())
+        signals.append(payload)
+        data["_feedback_signals"][improvement_id] = signals[-50:]
+        self._save(data)
+        return True
+
+    def feedback_signals(self, improvement_id: str) -> list[dict[str, Any]]:
+        data = self._load()
+        signals = data.get("_feedback_signals", {}).get(improvement_id, [])
+        self._prune_feedback_signals(signals)
+        self._save(data)
+        return signals if isinstance(signals, list) else []
+
     def has_issue_fingerprint(self, fingerprint: str) -> bool:
         data = self._load()
         self._prune_fingerprints(data)
@@ -181,6 +223,12 @@ class InteractionStore:
         for chat_id, payload in list(data.get("_feedback", {}).items()):
             if _expired(payload.get("timestamp"), FEEDBACK_TTL):
                 data.get("_feedback", {}).pop(chat_id, None)
+        for chat_id, payload in list(data.get("_backlog_lists", {}).items()):
+            if _expired(payload.get("timestamp"), FEEDBACK_TTL):
+                data.get("_backlog_lists", {}).pop(chat_id, None)
+        for signals in data.get("_feedback_signals", {}).values():
+            if isinstance(signals, list):
+                self._prune_feedback_signals(signals)
         self._save(data)
 
     def _prune_fingerprints(self, data: dict[str, Any]) -> None:
@@ -188,6 +236,11 @@ class InteractionStore:
         for key, timestamp in list(fingerprints.items()):
             if _expired(timestamp, FINGERPRINT_TTL):
                 fingerprints.pop(key, None)
+
+    def _prune_feedback_signals(self, signals: list[dict[str, Any]]) -> None:
+        for item in list(signals):
+            if _expired(item.get("timestamp"), FINGERPRINT_TTL):
+                signals.remove(item)
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -223,3 +276,7 @@ def _expired(timestamp: Any, ttl: timedelta) -> bool:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) - parsed > ttl
+
+
+def _normalized_signal_text(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())

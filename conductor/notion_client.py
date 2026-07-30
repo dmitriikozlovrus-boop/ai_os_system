@@ -208,6 +208,36 @@ class NotionClient:
             ]
         return summaries
 
+    def list_open_improvements(
+        self,
+        *,
+        limit: int = 10,
+        priority: str = "",
+        status: str = "",
+        component: str = "",
+    ) -> list[ImprovementSummary]:
+        if not self.token or not self.improvements_db:
+            return []
+        statuses = [status] if status else sorted(IMPROVEMENT_OPEN_STATUSES)
+        filters: list[dict[str, Any]] = [
+            {"or": [{"property": "Статус", "select": {"equals": item}} for item in statuses]},
+        ]
+        if priority:
+            filters.append({"property": "Приоритет", "select": {"equals": priority}})
+        if component:
+            filters.append({"property": "Где изменить", "select": {"equals": component}})
+        payload: dict[str, Any] = {
+            "page_size": max(1, min(limit, 100)),
+            "filter": {"and": filters},
+        }
+        data = request_json(
+            "POST",
+            f"https://api.notion.com/v1/databases/{self.improvements_db}/query",
+            headers=self.headers,
+            payload=payload,
+        )
+        return [_improvement_summary(row) for row in data.get("results", [])]
+
     def create_improvement(self, improvement: ImprovementRecord, *, related_issue_urls: list[str]) -> str:
         if not self.improvements_db:
             raise RuntimeError("NOTION_IMPROVEMENTS_DATABASE_ID is not configured")
@@ -231,6 +261,28 @@ class NotionClient:
             f"https://api.notion.com/v1/pages/{improvement_page_id}",
             headers=self.headers,
             payload={"properties": {"Какие ошибки исправляет": {"relation": relation}}},
+        )
+
+    def update_improvement_priority(self, improvement_ref: str, priority: str) -> None:
+        if priority not in IMPROVEMENT_PRIORITIES:
+            raise ValueError(f"Unknown Improvement priority: {priority}")
+        page_id = notion_page_id_from_reference(improvement_ref)
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=self.headers,
+            payload={"properties": {"Приоритет": _select_prop(priority)}},
+        )
+
+    def update_improvement_status(self, improvement_ref: str, status: str) -> None:
+        if status not in IMPROVEMENT_OPEN_STATUSES:
+            raise ValueError(f"Unknown Improvement status: {status}")
+        page_id = notion_page_id_from_reference(improvement_ref)
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=self.headers,
+            payload={"properties": {"Статус": _select_prop(status)}},
         )
 
     def get_improvement(self, improvement_ref: str) -> ImprovementSummary:
@@ -259,13 +311,20 @@ class NotionClient:
             payload=payload,
         )
 
-    def _archive_existing_technical_spec(self, page_id: str) -> None:
-        data = request_json(
-            "GET",
-            f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100",
-            headers=self.headers,
+    def update_improvement_feedback_summary(self, improvement_ref: str, markdown: str) -> None:
+        page_id = notion_page_id_from_reference(improvement_ref)
+        blocks = self._list_block_children(page_id)
+        self._replace_managed_section(
+            page_id,
+            blocks,
+            start_marker="CONDUCTOR_FEEDBACK_SUMMARY_START",
+            end_marker="CONDUCTOR_FEEDBACK_SUMMARY_END",
+            children=_feedback_summary_blocks(markdown),
+            heading="Сводка обратной связи",
         )
-        blocks = data.get("results", []) or []
+
+    def _archive_existing_technical_spec(self, page_id: str) -> None:
+        blocks = self._list_block_children(page_id)
         deleting = False
         for block in blocks:
             block_id = block.get("id")
@@ -280,6 +339,60 @@ class NotionClient:
                 )
             if deleting and "CONDUCTOR_TECH_SPEC_END" in _block_plain_text(block):
                 break
+
+    def _list_block_children(self, page_id: str) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+        cursor = ""
+        while True:
+            suffix = f"?page_size=100{('&start_cursor=' + cursor) if cursor else ''}"
+            data = request_json(
+                "GET",
+                f"https://api.notion.com/v1/blocks/{page_id}/children{suffix}",
+                headers=self.headers,
+            )
+            blocks.extend(data.get("results", []) or [])
+            if not data.get("has_more") or not data.get("next_cursor"):
+                break
+            cursor = str(data["next_cursor"])
+        return blocks
+
+    def _replace_managed_section(
+        self,
+        page_id: str,
+        blocks: list[dict[str, Any]],
+        *,
+        start_marker: str,
+        end_marker: str,
+        children: list[dict[str, Any]],
+        heading: str,
+    ) -> None:
+        start_indexes = [index for index, block in enumerate(blocks) if start_marker in _block_plain_text(block)]
+        end_indexes = [index for index, block in enumerate(blocks) if end_marker in _block_plain_text(block)]
+        if len(start_indexes) > 1 or len(end_indexes) > 1:
+            raise RuntimeError("Conflicting managed section markers")
+        if end_indexes and not start_indexes:
+            raise RuntimeError("Managed section end marker without start marker")
+        if start_indexes:
+            start = start_indexes[0]
+            end = next((index for index in end_indexes if index >= start), None)
+            if end is None:
+                raise RuntimeError("Managed section end marker is missing")
+            archive_from = start - 1 if start > 0 and _block_plain_text(blocks[start - 1]).strip() == heading else start
+            for block in blocks[archive_from : end + 1]:
+                block_id = block.get("id")
+                if block_id:
+                    request_json(
+                        "PATCH",
+                        f"https://api.notion.com/v1/blocks/{block_id}",
+                        headers=self.headers,
+                        payload={"archived": True},
+                    )
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=self.headers,
+            payload={"children": children},
+        )
 
     def update_task(
         self,
@@ -465,6 +578,9 @@ def _improvement_summary(row: dict[str, Any]) -> ImprovementSummary:
         improvement_type=_select(props.get("Тип улучшения")),
         change_location=_select(props.get("Где изменить")),
         related_issue_urls=[item.get("id", "") for item in relation if item.get("id")],
+        priority=_select(props.get("Приоритет")),
+        description=_rich_text(props.get("Описание")),
+        suggested_change=_rich_text(props.get("Что изменить")),
     )
 
 
@@ -481,6 +597,19 @@ def _technical_spec_blocks(markdown: str, *, today: str) -> list[dict[str, Any]]
     for chunk in _chunks(markdown, 1800):
         blocks.append(_paragraph_block(chunk))
     blocks.append(_paragraph_block("<!-- CONDUCTOR_TECH_SPEC_END -->"))
+    return blocks
+
+
+def _feedback_summary_blocks(markdown: str) -> list[dict[str, Any]]:
+    blocks = [
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Сводка обратной связи"}}]},
+        }
+    ]
+    for chunk in _chunks(markdown, 1800):
+        blocks.append(_paragraph_block(chunk))
     return blocks
 
 
