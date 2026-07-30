@@ -11,6 +11,7 @@ from .integration_validation import validate_feedback_backlog_schema, validate_o
 from .models import ImprovementSummary
 from .notion_client import NotionClient
 from .openai_client import OpenAIClient
+from .write_guard import ProductionWriteBlocked, ProductionWriteGuard
 
 
 def main() -> int:
@@ -25,11 +26,9 @@ def main() -> int:
     settings = get_settings()
     print("LIVE_SMOKE_STARTED")
     if args.write_smoke:
-        if settings.backlog_production_dry_run or os.getenv("SMOKE_TEST_WRITES_ENABLED", "").casefold() not in {"1", "true", "yes", "on"}:
+        if settings.backlog_production_dry_run or not settings.smoke_test_writes_enabled:
             print("LIVE_SMOKE_FAILED write smoke is blocked: require --write-smoke, BACKLOG_PRODUCTION_DRY_RUN=false and SMOKE_TEST_WRITES_ENABLED=true")
             return 2
-        print("LIVE_SMOKE_FAILED write smoke is documented but not automated by Codex")
-        return 2
 
     notion = NotionClient(
         token=settings.notion_token,
@@ -50,6 +49,7 @@ def main() -> int:
             print("OpenAI contracts: not_checked (OPENAI_API_KEY is not configured)")
 
     if args.dry_run:
+        guard = ProductionWriteGuard(dry_run=True)
         fake_openai = Mock()
         feedback = normalize_with_ai(openai=fake_openai, raw_text="[SMOKE TEST] Ты часто теряешь даты", interaction=None, enabled=False)
         improvement = ImprovementSummary(
@@ -68,8 +68,24 @@ def main() -> int:
         readiness = calculate_readiness(improvement, [])
         with TemporaryDirectory():
             pass
+        for operation in ("create_system_issue", "create_improvement", "update_feedback_summary", "save_technical_spec"):
+            try:
+                guard.assert_write_allowed(operation)
+            except ProductionWriteBlocked:
+                pass
         print(f"dry-run feedback={feedback.feedback_kind} matches={len(matches)} readiness={readiness.status}:{readiness.score}")
         print("Режим проверки: данные не будут записаны в Notion.")
+        summary = guard.summary()
+        print(f"writes attempted: {summary['writes_attempted']}")
+        print(f"writes blocked: {summary['writes_blocked']}")
+        print(f"writes completed: {summary['writes_completed']}")
+
+    if args.write_smoke:
+        if not (settings.notion_token and settings.notion_system_issues_database_id and settings.notion_improvements_database_id):
+            print("LIVE_SMOKE_FAILED write smoke is blocked: Notion credentials/databases are not configured")
+            return 2
+        print("LIVE_SMOKE_FAILED write smoke requires a live Telegram/Notion pilot step and is not run automatically")
+        return 2
 
     print("LIVE_SMOKE_COMPLETED")
     return 0

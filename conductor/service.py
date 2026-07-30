@@ -86,6 +86,7 @@ from .repository_context import RepositoryContextProvider
 from .telegram import TelegramClient
 from .todoist_client import TodoistClient
 from .task_sync import TaskSyncService
+from .write_guard import ProductionWriteBlocked, ProductionWriteGuard
 
 
 class ConductorService:
@@ -136,6 +137,7 @@ class ConductorService:
         self.recent = RecentStore(settings.recent_store_path)
         self.interactions = InteractionStore(settings.interaction_store_path)
         self.repository_context = RepositoryContextProvider()
+        self.write_guard = ProductionWriteGuard(dry_run=settings.backlog_production_dry_run)
         _log_startup_diagnostics(settings)
 
     def process_text(
@@ -453,9 +455,18 @@ class ConductorService:
             interaction=interaction,
             detection_method="Пользователь",
         )
+        if self.interactions.has_issue_fingerprint(issue.fingerprint):
+            self._send_message(chat_id, "Этот feedback уже зафиксирован. Дубликат System Issue не создаю.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback issue duplicate"]}
         errors: list[str] = []
         try:
+            self._assert_write_allowed("create_system_issue")
             issue_url = self.notion.create_system_issue(issue)
+            self._record_write_completed()
+            self.interactions.remember_issue_fingerprint(issue.fingerprint)
+        except ProductionWriteBlocked:
+            self._send_message(chat_id, _dry_run_message() + "\n\nSystem Issue не создан.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run system issue blocked"]}
         except Exception as exc:  # noqa: BLE001
             print(f"ISSUE_CAPTURE_ERROR feedback: {exc}", flush=True)
             errors.append(str(exc))
@@ -542,7 +553,9 @@ class ConductorService:
                     self._send_message(chat_id, _dry_run_message() + "\n\nПриоритет не изменен.")
                     return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run priority blocked"]}
                 try:
+                    self._assert_write_allowed("update_improvement_priority")
                     self.notion.update_improvement_priority(str(feedback.get("improvement_page_id") or feedback.get("improvement_url") or ""), str(feedback.get("priority") or ""))
+                    self._record_write_completed()
                 except Exception as exc:  # noqa: BLE001
                     print(f"FEEDBACK_BACKLOG_ERROR state=priority_change improvement_id={feedback.get('improvement_page_id')}: {exc}", flush=True)
                     self._send_message(chat_id, f"Не смогла изменить приоритет: {_safe_error(exc)}")
@@ -560,7 +573,9 @@ class ConductorService:
                     self._send_message(chat_id, _dry_run_message() + "\n\nСтатус не изменен.")
                     return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run status blocked"]}
                 try:
+                    self._assert_write_allowed("update_improvement_status")
                     self.notion.update_improvement_status(str(feedback.get("improvement_page_id") or feedback.get("improvement_url") or ""), str(feedback.get("status") or ""))
+                    self._record_write_completed()
                 except Exception as exc:  # noqa: BLE001
                     print(f"FEEDBACK_BACKLOG_ERROR state=status_change improvement_id={feedback.get('improvement_page_id')}: {exc}", flush=True)
                     self._send_message(chat_id, f"Не смогла изменить статус: {_safe_error(exc)}")
@@ -603,11 +618,13 @@ class ConductorService:
                     self._send_message(chat_id, _dry_run_message() + "\n\nТЗ не сохранено в Notion.")
                     return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run technical spec save blocked"]}
                 try:
+                    self._assert_write_allowed("save_technical_spec")
                     self.notion.save_improvement_technical_spec(
                         str(feedback.get("improvement_page_id") or feedback.get("improvement_url") or ""),
                         str(feedback.get("markdown") or ""),
                         today=date.today().isoformat(),
                     )
+                    self._record_write_completed()
                 except Exception as exc:  # noqa: BLE001
                     print(f"TECH_SPEC_SAVE_ERROR improvement_id={feedback.get('improvement_page_id')}: {exc}", flush=True)
                     self._send_message(chat_id, f"Не смогла сохранить ТЗ в Improvement: {_safe_error(exc)}")
@@ -787,7 +804,12 @@ class ConductorService:
         )
         try:
             print("IMPROVEMENT_CREATE_STARTED state=create", flush=True)
+            self._assert_write_allowed("create_improvement")
             url = self.notion.create_improvement(improvement, related_issue_urls=feedback.get("related_issue_urls", []))
+            self._record_write_completed()
+        except ProductionWriteBlocked:
+            self._send_message(chat_id, _dry_run_message() + "\n\nImprovement не создан.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run improvement create blocked"]}
         except Exception as exc:  # noqa: BLE001
             print(f"IMPROVEMENT_CREATE_ERROR: {exc}", flush=True)
             self._send_message(chat_id, f"Не смогла создать Improvement: {_safe_error(exc)}")
@@ -812,10 +834,12 @@ class ConductorService:
             self._send_message(chat_id, _dry_run_message() + "\n\nRelation и summary не изменены.")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run relation blocked"]}
         try:
+            self._assert_write_allowed("update_improvement_relation")
             self.notion.add_issues_to_improvement(
                 str(existing.get("page_id") or _extract_notion_page_id(str(existing.get("url") or ""))),
                 related_issue_urls=related_issue_urls,
             )
+            self._record_write_completed()
             if feedback.get("normalized_feedback"):
                 self._update_backlog_summary_for_feedback(
                     existing,
@@ -942,7 +966,14 @@ class ConductorService:
                 self._send_message(chat_id, _dry_run_message())
             else:
                 try:
-                    issue_url = self.notion.create_system_issue(issue)
+                    if self.interactions.has_issue_fingerprint(issue.fingerprint):
+                        issue_url = ""
+                        self._send_message(chat_id, "Этот feedback уже зафиксирован. Дубликат System Issue не создаю.")
+                    else:
+                        self._assert_write_allowed("create_system_issue")
+                        issue_url = self.notion.create_system_issue(issue)
+                        self._record_write_completed()
+                        self.interactions.remember_issue_fingerprint(issue.fingerprint)
                 except Exception as exc:  # noqa: BLE001
                     print(f"FEEDBACK_BACKLOG_ERROR state=system_issue_create: {exc}", flush=True)
                     self._send_message(chat_id, f"Не смогла сохранить feedback в SYSTEM ISSUES: {_safe_error(exc)}")
@@ -1034,7 +1065,9 @@ class ConductorService:
             self._send_message(chat_id, _dry_run_message() + "\n\nImprovement не создан.")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run improvement create blocked"]}
         try:
+            self._assert_write_allowed("create_improvement")
             url = self.notion.create_improvement(improvement, related_issue_urls=feedback_state.get("related_issue_urls", []))
+            self._record_write_completed()
             page_id = _safe_notion_page_id(url)
             self._update_backlog_summary_for_feedback({"page_id": page_id, "url": url, "related_issue_urls": feedback_state.get("related_issue_urls", [])}, feedback, system_issue_url=str(feedback_state.get("system_issue_url") or ""))
         except Exception as exc:  # noqa: BLE001
@@ -1057,7 +1090,9 @@ class ConductorService:
         if _backlog_production_dry_run(getattr(self, "settings", None)):
             print("BACKLOG_DRY_RUN_WRITE_BLOCKED state=feedback_summary_save", flush=True)
             return
+        self._assert_write_allowed("update_feedback_summary")
         self.notion.update_improvement_feedback_summary(page_id, markdown)
+        self._record_write_completed()
         print(f"FEEDBACK_SUMMARY_UPDATED improvement_id={page_id} signal_count={len(signals)} state={'added' if added else 'duplicate'}", flush=True)
 
     def _handle_backlog_browse_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
@@ -1215,7 +1250,9 @@ class ConductorService:
             self._send_message(chat_id, _dry_run_message() + "\n\nMerge не выполнен.")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["dry-run merge blocked"]}
         try:
+            self._assert_write_allowed("merge_update_primary_relations")
             self.notion.add_issues_to_improvement(str(primary.get("page_id") or primary.get("url") or ""), related_issue_urls=proposal.get("relation_ids_to_keep", []))
+            self._record_write_completed()
             for signal in self.interactions.feedback_signals(str(secondary.get("page_id") or "")):
                 self.interactions.remember_feedback_signal(str(primary.get("page_id") or ""), signal)
             self._update_backlog_summary_for_feedback(primary, normalize_feedback(f"Объединено с: {secondary.get('url') or secondary.get('title') or ''}"))
@@ -1224,7 +1261,9 @@ class ConductorService:
             self._send_message(chat_id, f"Не смогла выполнить merge: {_safe_error(exc)}")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["backlog merge failed"]}
         try:
+            self._assert_write_allowed("merge_update_secondary_status")
             self.notion.update_improvement_status(str(secondary.get("page_id") or secondary.get("url") or ""), "Отложено")
+            self._record_write_completed()
         except Exception as exc:  # noqa: BLE001
             print(f"BACKLOG_MERGE_PARTIAL_FAILURE improvement_id={primary.get('page_id')}: {exc}", flush=True)
             self._send_message(chat_id, "Основной Improvement обновлен, но второй не удалось отложить.")
@@ -1385,7 +1424,9 @@ class ConductorService:
         issue = self._build_system_issue(command=title, correction="\n".join(errors), interaction=interaction, detection_method="Дирижёр")
         issue.fingerprint = fingerprint
         try:
+            self._assert_write_allowed("create_automatic_system_issue")
             self.notion.create_system_issue(issue)
+            self._record_write_completed()
             self.interactions.remember_issue_fingerprint(fingerprint)
             if interaction_id:
                 self.interactions.append(interaction_id, "system_issues", {"fingerprint": fingerprint, "title": title})
@@ -1403,6 +1444,18 @@ class ConductorService:
             if message_id is not None:
                 self.interactions.append(interaction_id, "bot_message_ids", message_id)
         return result
+
+    def _assert_write_allowed(self, operation: str) -> None:
+        guard = getattr(self, "write_guard", None)
+        if guard is None:
+            guard = ProductionWriteGuard(dry_run=_backlog_production_dry_run(getattr(self, "settings", None)))
+            self.write_guard = guard
+        guard.assert_write_allowed(operation)
+
+    def _record_write_completed(self) -> None:
+        guard = getattr(self, "write_guard", None)
+        if guard is not None:
+            guard.record_completed()
 
     def _task_questions(self, item: TaskItem) -> list[str]:
         questions: list[str] = []

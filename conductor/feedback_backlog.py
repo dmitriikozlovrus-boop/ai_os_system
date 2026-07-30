@@ -305,7 +305,7 @@ def _is_neutral_reply(text: str) -> bool:
 
 
 def _is_idea(text: str) -> bool:
-    return any(marker in text for marker in ("надо, чтобы", "нужно ", "хорошо бы", "добавь возможность", "нужно показывать"))
+    return any(marker in text for marker in ("надо, чтобы", "нужно ", "хорошо бы", "добавь возможность", "нужно показывать", "не создавай"))
 
 
 def _is_general_problem(text: str) -> bool:
@@ -313,9 +313,11 @@ def _is_general_problem(text: str) -> bool:
 
 
 def _is_concrete_error(text: str) -> bool:
-    if ("товар" in text or "покуп" in text) and ("study" in text or "учеб" in text or "исслед" in text):
+    if ("товар" in text or "покуп" in text) and ("study" in text or "учеб" in text or "исслед" in text or "изуч" in text):
         return True
-    return any(marker in text for marker in ("неправильно", "ошибка", "не та база", "неверная дата", "не тот проект", "дубликат", "фигн", "создала запись"))
+    if _is_general_problem(text) and "создала запись" in text and not any(marker in text for marker in ("неправильно", "ошибка", "не та база", "не в той базе", "неверная дата", "не тот проект", "дубликат", "фигн")):
+        return False
+    return any(marker in text for marker in ("неправильно", "ошибка", "не та база", "не в той базе", "неверная дата", "не тот проект", "дубликат", "фигн", "создала запись"))
 
 
 def _is_ambiguous(text: str) -> bool:
@@ -323,7 +325,7 @@ def _is_ambiguous(text: str) -> bool:
 
 
 def _problem_title(text: str, *, recurring: bool) -> str:
-    if ("товар" in text or "покуп" in text) and ("study" in text or "учеб" in text or "исслед" in text):
+    if ("товар" in text or "покуп" in text) and ("study" in text or "учеб" in text or "исслед" in text or "изуч" in text):
         return "Товар ошибочно классифицирован как Study"
     if "дат" in text:
         return "Дата неверно определяется или теряется"

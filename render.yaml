@@ -64,6 +64,8 @@ services:
         value: false
       - key: BACKLOG_PRODUCTION_DRY_RUN
         value: true
+      - key: SMOKE_TEST_WRITES_ENABLED
+        value: false
       - key: NOTION_TASKS_DATABASE_ID
         value: be9d26fe652b474696cd5de0118b1210
       - key: NOTION_STUDY_DATABASE_ID

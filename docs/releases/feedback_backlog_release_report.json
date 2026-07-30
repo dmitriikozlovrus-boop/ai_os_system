@@ -1,0 +1,27 @@
+{
+  "release": "feedback-backlog-mvp",
+  "commit": "reported-after-release-commit",
+  "unit_tests": {
+    "passed": 227,
+    "failed": 0
+  },
+  "notion_schema": {
+    "system_issues": "invalid",
+    "improvements": "invalid"
+  },
+  "openai_contracts": {
+    "feedback_enrichment": "not_checked",
+    "semantic_matching": "not_checked",
+    "technical_spec": "not_checked"
+  },
+  "dry_run": "passed",
+  "write_smoke": "blocked_by_safe_flags",
+  "telegram_pilot": "not_run",
+  "production_ready": false,
+  "blockers": [
+    "Notion credentials/database IDs are not configured in this environment, so live schema validation did not pass.",
+    "OPENAI_API_KEY is not configured in this environment, so live OpenAI contracts were not checked.",
+    "Controlled write smoke was not run because write safeguards/credentials were not enabled.",
+    "Telegram pilot was not run because no test Telegram chat credentials were provided."
+  ]
+}

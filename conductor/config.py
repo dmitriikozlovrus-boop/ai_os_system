@@ -45,6 +45,7 @@ class Settings:
     feedback_backlog_enabled: bool
     backlog_ai_triage_enabled: bool
     backlog_production_dry_run: bool
+    smoke_test_writes_enabled: bool
     notion_projects_database_id: str
     notion_streams_database_id: str
     host: str
@@ -94,6 +95,7 @@ def get_settings() -> Settings:
         feedback_backlog_enabled=_bool("FEEDBACK_BACKLOG_ENABLED", False),
         backlog_ai_triage_enabled=_bool("BACKLOG_AI_TRIAGE_ENABLED", False),
         backlog_production_dry_run=_bool("BACKLOG_PRODUCTION_DRY_RUN", True),
+        smoke_test_writes_enabled=_bool("SMOKE_TEST_WRITES_ENABLED", False),
         notion_projects_database_id=os.getenv("NOTION_PROJECTS_DATABASE_ID", ""),
         notion_streams_database_id=os.getenv("NOTION_STREAMS_DATABASE_ID", ""),
         host=os.getenv("HOST", "0.0.0.0"),

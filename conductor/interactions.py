@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 
 FEEDBACK_TTL = timedelta(hours=24)
 FINGERPRINT_TTL = timedelta(days=7)
+_SIGNAL_LOCKS: dict[str, threading.Lock] = {}
 
 
 class InteractionStore:
@@ -204,19 +206,21 @@ class InteractionStore:
         return payload
 
     def remember_feedback_signal(self, improvement_id: str, signal: dict[str, Any]) -> bool:
-        data = self._load()
-        signals = data.setdefault("_feedback_signals", {}).setdefault(improvement_id, [])
-        self._prune_feedback_signals(signals)
-        normalized = _normalized_signal_text(signal.get("original"))
-        if normalized and any(_normalized_signal_text(item.get("original")) == normalized for item in signals):
+        lock = _SIGNAL_LOCKS.setdefault(f"{self.path}:{improvement_id}", threading.Lock())
+        with lock:
+            data = self._load()
+            signals = data.setdefault("_feedback_signals", {}).setdefault(improvement_id, [])
+            self._prune_feedback_signals(signals)
+            normalized = _normalized_signal_text(signal.get("original"))
+            if normalized and any(_normalized_signal_text(item.get("original")) == normalized for item in signals):
+                self._save(data)
+                return False
+            payload = dict(signal)
+            payload.setdefault("timestamp", _now())
+            signals.append(payload)
+            data["_feedback_signals"][improvement_id] = signals[-50:]
             self._save(data)
-            return False
-        payload = dict(signal)
-        payload.setdefault("timestamp", _now())
-        signals.append(payload)
-        data["_feedback_signals"][improvement_id] = signals[-50:]
-        self._save(data)
-        return True
+            return True
 
     def feedback_signals(self, improvement_id: str) -> list[dict[str, Any]]:
         data = self._load()

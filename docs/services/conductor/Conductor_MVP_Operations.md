@@ -621,6 +621,26 @@ python3 -m conductor.feedback_backlog_smoke --validate-only
 python3 -m conductor.feedback_backlog_smoke --dry-run
 ```
 
+## Feedback Backlog MVP Release Runbook
+
+Release document:
+
+```text
+docs/releases/Feedback_Backlog_MVP_Release.md
+```
+
+Before enabling production writes:
+
+1. Run `python3 -m conductor.feedback_backlog_smoke --validate-only`.
+2. Confirm Notion `SYSTEM ISSUES` and `IMPROVEMENTS` schemas.
+3. Confirm OpenAI structured output contracts on `[SMOKE TEST]` data.
+4. Run `python3 -m conductor.feedback_backlog_smoke --dry-run` and verify `writes completed: 0`.
+5. Enable `BACKLOG_PRODUCTION_DRY_RUN=false` and `SMOKE_TEST_WRITES_ENABLED=true` only for controlled write smoke.
+6. Disable `SMOKE_TEST_WRITES_ENABLED` immediately after write smoke.
+7. Run Telegram pilot in a test chat before broad production use.
+
+Rollback does not delete data. Set `BACKLOG_PRODUCTION_DRY_RUN=true` or disable `FEEDBACK_BACKLOG_ENABLED`, `BACKLOG_AI_TRIAGE_ENABLED` and `TECHNICAL_SPEC_GENERATION_ENABLED`.
+
 Ограничения MVP:
 
 - нет автоматического удаления или архивирования ошибочных исходных записей;
