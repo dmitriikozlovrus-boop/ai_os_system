@@ -11,8 +11,8 @@ class TelegramClient:
         self.base = f"https://api.telegram.org/bot{token}"
         self.file_base = f"https://api.telegram.org/file/bot{token}"
 
-    def send_message(self, chat_id: int, text: str) -> None:
-        request_json(
+    def send_message(self, chat_id: int, text: str) -> dict[str, Any]:
+        return request_json(
             "POST",
             f"{self.base}/sendMessage",
             payload={"chat_id": chat_id, "text": text[:4096]},

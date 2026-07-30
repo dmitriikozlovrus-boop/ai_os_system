@@ -37,6 +37,15 @@ class Settings:
     notion_token: str
     notion_tasks_database_id: str
     notion_study_database_id: str
+    notion_goods_database_id: str
+    notion_system_issues_database_id: str
+    notion_improvements_database_id: str
+    system_improvements_enabled: bool
+    technical_spec_generation_enabled: bool
+    feedback_backlog_enabled: bool
+    backlog_ai_triage_enabled: bool
+    backlog_production_dry_run: bool
+    smoke_test_writes_enabled: bool
     notion_projects_database_id: str
     notion_streams_database_id: str
     host: str
@@ -44,6 +53,7 @@ class Settings:
     confidence_threshold: float
     pending_store_path: str
     recent_store_path: str
+    interaction_store_path: str
     timezone: str
     todoist_enabled: bool
     todoist_api_token: str
@@ -77,6 +87,15 @@ def get_settings() -> Settings:
         notion_token=os.getenv("NOTION_TOKEN", ""),
         notion_tasks_database_id=os.getenv("NOTION_TASKS_DATABASE_ID", ""),
         notion_study_database_id=os.getenv("NOTION_STUDY_DATABASE_ID", ""),
+        notion_goods_database_id=os.getenv("NOTION_GOODS_DATABASE_ID", ""),
+        notion_system_issues_database_id=os.getenv("NOTION_SYSTEM_ISSUES_DATABASE_ID", ""),
+        notion_improvements_database_id=os.getenv("NOTION_IMPROVEMENTS_DATABASE_ID", ""),
+        system_improvements_enabled=_bool("SYSTEM_IMPROVEMENTS_ENABLED", False),
+        technical_spec_generation_enabled=_bool("TECHNICAL_SPEC_GENERATION_ENABLED", False),
+        feedback_backlog_enabled=_bool("FEEDBACK_BACKLOG_ENABLED", False),
+        backlog_ai_triage_enabled=_bool("BACKLOG_AI_TRIAGE_ENABLED", False),
+        backlog_production_dry_run=_bool("BACKLOG_PRODUCTION_DRY_RUN", True),
+        smoke_test_writes_enabled=_bool("SMOKE_TEST_WRITES_ENABLED", False),
         notion_projects_database_id=os.getenv("NOTION_PROJECTS_DATABASE_ID", ""),
         notion_streams_database_id=os.getenv("NOTION_STREAMS_DATABASE_ID", ""),
         host=os.getenv("HOST", "0.0.0.0"),
@@ -84,6 +103,7 @@ def get_settings() -> Settings:
         confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.70")),
         pending_store_path=os.getenv("PENDING_STORE_PATH", "data/pending.json"),
         recent_store_path=os.getenv("RECENT_STORE_PATH", "data/recent.json"),
+        interaction_store_path=os.getenv("INTERACTION_STORE_PATH", "data/interactions.json"),
         timezone=os.getenv("TIMEZONE", "America/Mexico_City"),
         todoist_enabled=_bool("TODOIST_ENABLED", False),
         todoist_api_token=os.getenv("TODOIST_API_TOKEN", ""),
