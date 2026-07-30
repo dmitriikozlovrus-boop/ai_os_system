@@ -1,27 +1,76 @@
 {
   "release": "feedback-backlog-mvp",
-  "commit": "reported-after-release-commit",
+  "commit": "e1cf9d9e38cc06ec79cc21434ef7d162c1d26a63",
+  "render": {
+    "service": "https://conductor-luba.onrender.com",
+    "deploy_id": "dep-d9ltkf710e5c73ec4r40",
+    "health": "ok",
+    "startup_diagnostics": {
+      "feedback_backlog": "enabled",
+      "backlog_ai_triage": "enabled",
+      "technical_spec": "enabled",
+      "dry_run": "enabled"
+    }
+  },
   "unit_tests": {
     "passed": 227,
     "failed": 0
   },
   "notion_schema": {
-    "system_issues": "invalid",
-    "improvements": "invalid"
+    "system_issues": "ok",
+    "improvements": "ok"
   },
   "openai_contracts": {
-    "feedback_enrichment": "not_checked",
-    "semantic_matching": "not_checked",
-    "technical_spec": "not_checked"
+    "feedback_enrichment": "ok",
+    "semantic_matching": "ok",
+    "technical_spec": "ok"
   },
   "dry_run": "passed",
-  "write_smoke": "blocked_by_safe_flags",
-  "telegram_pilot": "not_run",
+  "telegram_pilot": {
+    "status": "failed",
+    "chat_id_detected": false,
+    "webhook": {
+      "configured": true,
+      "host": "conductor-luba.onrender.com",
+      "pending_update_count": 0,
+      "last_error": null,
+      "route_check": "passed"
+    },
+    "read_only_scenarios": {
+      "neutral_message": "not_completed",
+      "general_problem": "not_completed",
+      "improvement_idea": "partial",
+      "concrete_error_reply": "not_completed",
+      "diagnostics": "not_completed"
+    },
+    "observed_runtime_events": [
+      "A real Telegram webhook update reached Render.",
+      "The update entered feedback normalization.",
+      "AI enrichment classified the message as IMPROVEMENT_IDEA with confidence 0.72.",
+      "The chat entered awaiting_feedback_clarification state."
+    ],
+    "failure_reason": "The requested read-only pilot sequence was not completed. Render logs do not include Telegram chat_id/message_id, and Telegram getUpdates cannot be used while the active webhook remains enabled."
+  },
+  "write_smoke": {
+    "status": "not_run",
+    "reason": "Read-only Telegram pilot did not pass.",
+    "system_issue_url": null,
+    "improvement_url": null,
+    "technical_spec": "not_run",
+    "duplicate_protection": "not_run",
+    "stale_snapshot": "not_run",
+    "regression": "not_run"
+  },
+  "final_feature_flags": {
+    "SYSTEM_IMPROVEMENTS_ENABLED": true,
+    "FEEDBACK_BACKLOG_ENABLED": true,
+    "BACKLOG_AI_TRIAGE_ENABLED": true,
+    "TECHNICAL_SPEC_GENERATION_ENABLED": true,
+    "BACKLOG_PRODUCTION_DRY_RUN": true,
+    "SMOKE_TEST_WRITES_ENABLED": false
+  },
   "production_ready": false,
   "blockers": [
-    "Notion credentials/database IDs are not configured in this environment, so live schema validation did not pass.",
-    "OPENAI_API_KEY is not configured in this environment, so live OpenAI contracts were not checked.",
-    "Controlled write smoke was not run because write safeguards/credentials were not enabled.",
-    "Telegram pilot was not run because no test Telegram chat credentials were provided."
+    "Live Telegram read-only pilot failed: the first observed update was classified as IMPROVEMENT_IDEA and moved the chat to awaiting_feedback_clarification before the required five-scenario pilot could complete."
   ]
 }

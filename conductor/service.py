@@ -500,6 +500,11 @@ class ConductorService:
         feedback: dict[str, Any],
     ) -> dict[str, Any]:
         state = feedback.get("state")
+        if _looks_like_cancel(text):
+            self.interactions.pop_feedback(chat_id)
+            print(f"FEEDBACK_STATE_CANCELLED state={state}", flush=True)
+            self._send_message(chat_id, "Ок, текущий сценарий отменен.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback state cancelled"]}
         if state == "awaiting_feedback_clarification":
             self.interactions.pop_feedback(chat_id)
             merged = f"{feedback.get('command') or ''}\n{text}".strip()
@@ -1554,6 +1559,18 @@ def _looks_like_improvement_no(text: str) -> bool:
     return text.strip().casefold() in {"нет", "не надо", "пропусти", "позже", "нет, не надо"}
 
 
+def _looks_like_cancel(text: str) -> bool:
+    return " ".join(text.strip().casefold().split()) in {
+        "отмена",
+        "отмени",
+        "стоп",
+        "сброс",
+        "сбрось",
+        "/cancel",
+        "cancel",
+    }
+
+
 def _looks_like_technical_spec_request(text: str) -> bool:
     normalized = " ".join(text.strip().casefold().split())
     if _extract_notion_url(text) and any(marker in normalized for marker in ("тз", "техничес", "кодекс", "codex")):
@@ -1590,10 +1607,12 @@ def _log_startup_diagnostics(settings: Any) -> None:
         print("BACKLOG_AI_TRIAGE_ENABLED требует FEEDBACK_BACKLOG_ENABLED. AI triage отключен.", flush=True)
     tech = "enabled" if _technical_spec_generation_enabled(settings) else "disabled"
     dry = "enabled" if _backlog_production_dry_run(settings) else "disabled"
+    smoke = "enabled" if getattr(settings, "smoke_test_writes_enabled", False) is True else "disabled"
     print(f"FEEDBACK_BACKLOG: {feedback}", flush=True)
     print(f"BACKLOG_AI_TRIAGE: {ai}", flush=True)
     print(f"TECHNICAL_SPEC: {tech}", flush=True)
     print(f"DRY_RUN: {dry}", flush=True)
+    print(f"SMOKE_TEST_WRITES: {smoke}", flush=True)
     print("NOTION_SCHEMA: not_checked", flush=True)
     print("OPENAI_CONTRACT: not_checked", flush=True)
 

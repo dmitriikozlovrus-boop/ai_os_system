@@ -54,6 +54,25 @@ class FeedbackBacklogTest(unittest.TestCase):
             service.notion.create_system_issue.assert_not_called()
             self.assertEqual(service.interactions.get_feedback(42)["state"], "awaiting_new_improvement_confirmation")
 
+    def test_cancel_clears_feedback_state_without_reprocessing(self):
+        with TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            service.interactions.update_feedback(
+                42,
+                {
+                    "state": "awaiting_feedback_clarification",
+                    "command": "Нужно что-то улучшить",
+                    "normalized_feedback": {},
+                },
+            )
+
+            result = service.process_text("отмена", chat_id=42)
+
+            self.assertEqual(result["notes"], ["feedback state cancelled"])
+            self.assertIsNone(service.interactions.get_feedback(42))
+            service.openai.classify.assert_not_called()
+            service.notion.create_system_issue.assert_not_called()
+
     def test_clean_idea_can_be_added_without_system_issue_after_confirmation(self):
         with TemporaryDirectory() as tmp:
             service = self._service(tmp)
