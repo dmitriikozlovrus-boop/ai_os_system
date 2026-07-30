@@ -60,6 +60,8 @@ services:
         value: 4e27e10ca2bf44a08b4c8f86c7a125bd
       - key: NOTION_GOODS_DATABASE_ID
         value: e327cd54181f44ba883bb5a012dfd3d7
+      - key: NOTION_SYSTEM_ISSUES_DATABASE_ID
+        value: 268ecbc58ba44b1787de101e49af1c73
       - key: NOTION_PROJECTS_DATABASE_ID
         value: bbb501a6933941b4837afff250479f0e
       - key: NOTION_STREAMS_DATABASE_ID

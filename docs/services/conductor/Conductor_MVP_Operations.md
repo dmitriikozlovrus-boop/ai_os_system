@@ -102,6 +102,7 @@ python3 -m conductor.cli "Завтра напомни написать Марк�
 | `Tasks` | `be9d26fe652b474696cd5de0118b1210` |
 | `Study / На изучение` | `4e27e10ca2bf44a08b4c8f86c7a125bd` |
 | `GOODS` | `e327cd54181f44ba883bb5a012dfd3d7` |
+| `SYSTEM ISSUES` | `268ecbc58ba44b1787de101e49af1c73` |
 | `Projects / Приоритеты` | `bbb501a6933941b4837afff250479f0e` |
 
 ## Важная логика MVP
@@ -318,6 +319,7 @@ NOTION_TOKEN
 NOTION_TASKS_DATABASE_ID
 NOTION_STUDY_DATABASE_ID
 NOTION_GOODS_DATABASE_ID
+NOTION_SYSTEM_ISSUES_DATABASE_ID
 NOTION_PROJECTS_DATABASE_ID
 TODOIST_API_TOKEN
 TODOIST_WEBHOOK_SECRET

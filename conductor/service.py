@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import date
 from typing import Any
 
 from .config import Settings
-from .models import Classification, GoodsItem, StudyItem, TaskItem
+from .interactions import InteractionStore
+from .models import Classification, GoodsItem, StudyItem, SystemIssueRecord, TaskItem
 from .notion_client import NotionClient
 from .openai_client import OpenAIClient, _extract_due_date, _normalize_area
 from .pending import PendingStore
@@ -29,6 +32,7 @@ class ConductorService:
             study_db=settings.notion_study_database_id,
             projects_db=settings.notion_projects_database_id,
             goods_db=settings.notion_goods_database_id,
+            system_issues_db=settings.notion_system_issues_database_id,
         )
         self.telegram = TelegramClient(settings.telegram_bot_token)
         # A configured token is enough to enable the client. The dedicated
@@ -58,8 +62,35 @@ class ConductorService:
         )
         self.pending = PendingStore(settings.pending_store_path)
         self.recent = RecentStore(settings.recent_store_path)
+        self.interactions = InteractionStore(settings.interaction_store_path)
 
-    def process_text(self, text: str, *, chat_id: int | None = None, source: str = "Telegram") -> dict[str, Any]:
+    def process_text(
+        self,
+        text: str,
+        *,
+        chat_id: int | None = None,
+        source: str = "Telegram",
+        telegram_message_id: int | None = None,
+        reply_to_message_id: int | None = None,
+        skip_feedback: bool = False,
+    ) -> dict[str, Any]:
+        if chat_id is not None and not skip_feedback and hasattr(self, "interactions"):
+            feedback = self.interactions.get_feedback(chat_id)
+            if feedback:
+                return self._handle_feedback_followup(text, chat_id=chat_id, source=source, feedback=feedback)
+            if _looks_like_feedback_command(text):
+                return self._start_feedback_flow(text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
+
+        interaction_id = None
+        if chat_id is not None and hasattr(self, "interactions"):
+            interaction_id = self.interactions.create(
+                chat_id,
+                text=text,
+                telegram_message_id=telegram_message_id,
+                reply_to_message_id=reply_to_message_id,
+                model=self.settings.openai_model,
+            )
+
         pending_item: dict[str, Any] | None = None
         if chat_id is not None:
             pending = self.pending.pop_oldest_for_chat(chat_id)
@@ -81,22 +112,34 @@ class ConductorService:
                     source=source,
                     projects=projects,
                     from_clarification=True,
+                    interaction_id=interaction_id,
+                    input_text=text,
                 )
             text = _merge_pending_text(pending_item, text)
         try:
             classification = self.openai.classify(text, projects=projects, today=date.today().isoformat())
         except Exception as exc:  # noqa: BLE001 - notify the user instead of returning a webhook 502.
+            self._record_automatic_issue(
+                "OpenAI failure",
+                input_text=text,
+                errors=[str(exc)],
+                interaction_id=interaction_id,
+            )
             if chat_id is not None:
                 self.telegram.send_message(chat_id, f"Не смог разобрать сообщение через AI: {exc}")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
         if pending_item:
             classification = _apply_clarification_fallbacks(classification)
+        if interaction_id:
+            self.interactions.update(interaction_id, classification=_classification_payload(classification), status="classified")
         return self._handle_classification(
             classification,
             chat_id=chat_id,
             source=source,
             projects=projects,
             from_clarification=bool(pending_item),
+            interaction_id=interaction_id,
+            input_text=text,
         )
 
     def process_audio(
@@ -161,6 +204,8 @@ class ConductorService:
         source: str,
         projects: list[dict[str, str]] | None = None,
         from_clarification: bool = False,
+        interaction_id: str | None = None,
+        input_text: str = "",
     ) -> dict[str, Any]:
         created_tasks: list[str] = []
         created_studies: list[str] = []
@@ -175,6 +220,9 @@ class ConductorService:
             questions = self._task_questions(item)
             if questions and chat_id is not None:
                 self.pending.add(chat_id, {"type": "task", "item": item.__dict__}, questions)
+                if interaction_id:
+                    self.interactions.append(interaction_id, "pending", {"type": "task", "item": item.__dict__})
+                    self.interactions.append(interaction_id, "questions", questions)
                 pending_count += 1
                 self.telegram.send_message(chat_id, _format_questions(item.title, questions))
                 continue
@@ -191,6 +239,9 @@ class ConductorService:
             questions = self._study_questions(item)
             if questions and chat_id is not None:
                 self.pending.add(chat_id, {"type": "study", "item": item.__dict__}, questions)
+                if interaction_id:
+                    self.interactions.append(interaction_id, "pending", {"type": "study", "item": item.__dict__})
+                    self.interactions.append(interaction_id, "questions", questions)
                 pending_count += 1
                 self.telegram.send_message(chat_id, _format_questions(item.question, questions))
                 continue
@@ -207,6 +258,9 @@ class ConductorService:
             questions = self._goods_questions(item)
             if questions and chat_id is not None:
                 self.pending.add(chat_id, {"type": "goods", "item": item.__dict__}, questions)
+                if interaction_id:
+                    self.interactions.append(interaction_id, "pending", {"type": "goods", "item": item.__dict__})
+                    self.interactions.append(interaction_id, "questions", questions)
                 pending_count += 1
                 self.telegram.send_message(chat_id, _format_questions(item.title or "Товар", questions))
                 continue
@@ -229,6 +283,15 @@ class ConductorService:
                 notes=classification.notes,
             )
             self.telegram.send_message(chat_id, _format_created_summary(created_classification, from_clarification=from_clarification))
+        if interaction_id:
+            self.interactions.update(
+                interaction_id,
+                created={"tasks": created_tasks, "studies": created_studies, "goods": created_goods},
+                errors=errors,
+                status="completed_with_errors" if errors else "completed",
+            )
+        if errors:
+            self._record_automatic_issue("Partial write" if (created_tasks or created_studies or created_goods) else "Notion failure", input_text=input_text, errors=errors, interaction_id=interaction_id)
         return {
             "tasks_created": created_tasks,
             "studies_created": created_studies,
@@ -237,6 +300,116 @@ class ConductorService:
             "errors": errors,
             "notes": classification.notes,
         }
+
+    def _start_feedback_flow(self, command: str, *, chat_id: int, reply_to_message_id: int | None) -> dict[str, Any]:
+        interaction = self.interactions.find_by_reply(chat_id, reply_to_message_id) or self.interactions.latest_for_chat(chat_id)
+        self.interactions.start_feedback(chat_id, command=command, interaction=interaction)
+        self.telegram.send_message(chat_id, _feedback_prompt())
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback correction requested"]}
+
+    def _handle_feedback_followup(
+        self,
+        text: str,
+        *,
+        chat_id: int,
+        source: str,
+        feedback: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = feedback.get("state")
+        if state == "awaiting_fix_confirmation":
+            self.interactions.pop_feedback(chat_id)
+            if _looks_like_yes(text):
+                original = str((feedback.get("interaction") or {}).get("input_text") or "")
+                correction = str(feedback.get("correction") or "")
+                merged = f"{original}\n\nИсправление пользователя: {correction}".strip()
+                return self.process_text(merged, chat_id=chat_id, source=source, skip_feedback=True)
+            self.telegram.send_message(chat_id, "Хорошо, запись сейчас не исправляю.")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback fix declined"]}
+
+        interaction = feedback.get("interaction") or {}
+        correction = text.strip()
+        issue = self._build_system_issue(
+            command=str(feedback.get("command") or ""),
+            correction=correction,
+            interaction=interaction,
+            detection_method="Пользователь",
+        )
+        errors: list[str] = []
+        try:
+            self.notion.create_system_issue(issue)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+        feedback.update({"state": "awaiting_fix_confirmation", "correction": correction, "issue": _issue_payload(issue)})
+        self.interactions.update_feedback(chat_id, feedback)
+        if errors:
+            self.telegram.send_message(chat_id, f"Не смогла сохранить ошибку в SYSTEM ISSUES: {errors[0]}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": errors, "notes": ["feedback issue save failed"]}
+        self.telegram.send_message(chat_id, _format_issue_saved(issue))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback issue saved"]}
+
+    def _build_system_issue(
+        self,
+        *,
+        command: str,
+        correction: str,
+        interaction: dict[str, Any],
+        detection_method: str,
+    ) -> SystemIssueRecord:
+        original = str(interaction.get("input_text") or "")
+        actual_context = {
+            "classification": interaction.get("classification"),
+            "created": interaction.get("created"),
+            "pending": interaction.get("pending"),
+            "questions": interaction.get("questions"),
+            "errors": interaction.get("errors"),
+        }
+        classification = self.openai.classify_system_issue(
+            original_text=original,
+            actual_context=actual_context,
+            command=command,
+            correction=correction,
+        )
+        input_data = _format_issue_input(original, interaction, command, correction)
+        description = _format_issue_description(classification, interaction)
+        solution = "Требуется анализ и исправление"
+        if correction:
+            solution += f"\n\nОжидаемое исправление:\n{correction}"
+        fingerprint = _fingerprint(detection_method, classification.issue_type, classification.database, original, correction)
+        return SystemIssueRecord(
+            classification=classification,
+            detection_method=detection_method,
+            status="Новая",
+            input_data=input_data,
+            description=description,
+            solution=solution,
+            detected_date=date.today().isoformat(),
+            fingerprint=fingerprint,
+        )
+
+    def _record_automatic_issue(
+        self,
+        title: str,
+        *,
+        input_text: str,
+        errors: list[str],
+        interaction_id: str | None,
+    ) -> None:
+        fingerprint = _fingerprint("Дирижёр", title, "Другое", input_text, "\n".join(errors))
+        if not hasattr(self, "interactions"):
+            return
+        if self.interactions.has_issue_fingerprint(fingerprint):
+            return
+        interaction = {"input_text": input_text, "errors": errors}
+        issue = self._build_system_issue(command=title, correction="\n".join(errors), interaction=interaction, detection_method="Дирижёр")
+        issue.fingerprint = fingerprint
+        try:
+            self.notion.create_system_issue(issue)
+            self.interactions.remember_issue_fingerprint(fingerprint)
+            if interaction_id:
+                self.interactions.append(interaction_id, "system_issues", {"fingerprint": fingerprint, "title": title})
+        except Exception as exc:  # noqa: BLE001
+            if interaction_id:
+                self.interactions.append(interaction_id, "errors", f"Could not record system issue: {exc}")
 
     def _task_questions(self, item: TaskItem) -> list[str]:
         questions: list[str] = []
@@ -276,6 +449,91 @@ class ConductorService:
 def _format_questions(title: str, questions: list[str]) -> str:
     joined = "\n".join(f"- {q}" for q in questions)
     return f"Нужно уточнение по записи:\n{title}\n\n{joined}\n\nОтветь одним сообщением, я сохраню это как уточнение для следующего шага."
+
+
+def _looks_like_feedback_command(text: str) -> bool:
+    normalized = text.strip().casefold()
+    return normalized in {"неправильно", "неверно", "ошибка", "не так", "/wrong", "/error"}
+
+
+def _looks_like_yes(text: str) -> bool:
+    return text.strip().casefold() in {"да", "yes", "y", "ага", "исправь", "исправить"}
+
+
+def _feedback_prompt() -> str:
+    return (
+        "Поняла.\n\n"
+        "Что должно было произойти?\n\n"
+        "Например:\n"
+        "- Это товар\n"
+        "- Это задача\n"
+        "- Не нужно было задавать уточнения\n"
+        "- Неверно определена база\n"
+        "- Неверно извлечена цена\n"
+        "- Нужно было создать две записи\n\n"
+        "Опишите правильный результат одним сообщением."
+    )
+
+
+def _format_issue_saved(issue: SystemIssueRecord) -> str:
+    return (
+        "Ошибка сохранена.\n\n"
+        f"Тип: {issue.classification.issue_type}\n"
+        f"База: {issue.classification.database}\n"
+        "Статус: Новая\n\n"
+        "Исправить запись сейчас?\n"
+        "Да\n"
+        "Нет"
+    )
+
+
+def _classification_payload(classification: Classification) -> dict[str, Any]:
+    return {
+        "tasks": [item.__dict__ for item in classification.tasks],
+        "studies": [item.__dict__ for item in classification.studies],
+        "goods": [item.__dict__ for item in classification.goods],
+        "notes": classification.notes,
+    }
+
+
+def _issue_payload(issue: SystemIssueRecord) -> dict[str, Any]:
+    return {
+        "classification": issue.classification.__dict__,
+        "detection_method": issue.detection_method,
+        "status": issue.status,
+        "input_data": issue.input_data,
+        "description": issue.description,
+        "solution": issue.solution,
+        "detected_date": issue.detected_date,
+        "fingerprint": issue.fingerprint,
+    }
+
+
+def _format_issue_input(original: str, interaction: dict[str, Any], command: str, correction: str) -> str:
+    return "\n".join(
+        [
+            f"Исходное сообщение: {original}",
+            f"Ответ бота: {json.dumps(interaction.get('bot_messages') or [], ensure_ascii=False)}",
+            f"Команда: {command}",
+            f"Ответ пользователя: {correction}",
+        ]
+    )
+
+
+def _format_issue_description(classification: Any, interaction: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            f"Что произошло: {classification.actual_result or 'Требуется анализ'}",
+            f"Что ожидалось: {classification.expected_result or 'Требуется анализ'}",
+            f"Какие сущности определены: {json.dumps(interaction.get('classification'), ensure_ascii=False)}",
+            f"Какие записи созданы: {json.dumps(interaction.get('created'), ensure_ascii=False)}",
+            f"Какие вопросы заданы: {json.dumps(interaction.get('questions') or [], ensure_ascii=False)}",
+        ]
+    )
+
+
+def _fingerprint(*parts: str) -> str:
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
 def _edit_guidance_message() -> str:

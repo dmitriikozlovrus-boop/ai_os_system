@@ -3,19 +3,28 @@ from __future__ import annotations
 from typing import Any
 
 from .http import request_json
-from .models import GoodsItem, StudyItem, TaskItem
+from .models import GoodsItem, StudyItem, SystemIssueRecord, TaskItem
 
 
 NOTION_VERSION = "2022-06-28"
 
 
 class NotionClient:
-    def __init__(self, token: str, tasks_db: str, study_db: str, projects_db: str, goods_db: str = ""):
+    def __init__(
+        self,
+        token: str,
+        tasks_db: str,
+        study_db: str,
+        projects_db: str,
+        goods_db: str = "",
+        system_issues_db: str = "",
+    ):
         self.token = token
         self.tasks_db = tasks_db
         self.study_db = study_db
         self.projects_db = projects_db
         self.goods_db = goods_db
+        self.system_issues_db = system_issues_db
 
     @property
     def headers(self) -> dict[str, str]:
@@ -79,6 +88,16 @@ class NotionClient:
         payload = {
             "parent": {"database_id": self.goods_db},
             "properties": _goods_properties(item, project_id=project_id),
+        }
+        data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
+        return data.get("url", "")
+
+    def create_system_issue(self, issue: SystemIssueRecord) -> str:
+        if not self.system_issues_db:
+            raise RuntimeError("NOTION_SYSTEM_ISSUES_DATABASE_ID is not configured")
+        payload = {
+            "parent": {"database_id": self.system_issues_db},
+            "properties": _system_issue_properties(issue),
         }
         data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
         return data.get("url", "")
@@ -196,6 +215,28 @@ def _goods_properties(item: GoodsItem, *, project_id: str | None = None) -> dict
     if project_id:
         properties["Проект"] = {"relation": [{"id": project_id}]}
     return properties
+
+
+def _system_issue_properties(issue: SystemIssueRecord) -> dict[str, Any]:
+    classification = issue.classification
+    return {
+        "Краткое описание ошибки": _title_prop(_issue_title(classification)),
+        "Тип ошибки": _select_prop(classification.issue_type),
+        "Статус": _select_prop(issue.status),
+        "Критичность": _select_prop(classification.severity),
+        "Способ обнаружения": _select_prop(issue.detection_method),
+        "База данных": _select_prop(classification.database),
+        "Входные данные": _rich_text_prop(issue.input_data),
+        "Описание": _rich_text_prop(issue.description),
+        "Причина ошибки": _rich_text_prop(classification.probable_cause or "Требуется анализ"),
+        "Решение": _rich_text_prop(issue.solution),
+        "Дата обнаружения": _date_prop(issue.detected_date),
+    }
+
+
+def _issue_title(classification: Any) -> str:
+    title = classification.title or classification.expected_result or classification.actual_result or "Ошибка Дирижера"
+    return f"{classification.issue_type}: {title}"[:2000]
 
 
 def _title(prop: dict[str, Any] | None) -> str:

@@ -1,14 +1,17 @@
 import unittest
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
-from conductor.models import GoodsItem, classification_from_dict, normalize_effort
-from conductor.notion_client import NotionClient, _goods_properties
+from conductor.interactions import InteractionStore
+from conductor.models import GoodsItem, SystemIssueClassification, SystemIssueRecord, classification_from_dict, normalize_effort
+from conductor.notion_client import NotionClient, _goods_properties, _system_issue_properties
 from conductor.openai_client import OpenAIClient, _postprocess_classification
 from conductor.service import (
     ConductorService,
     _apply_clarification_fallbacks,
     _apply_edit_to_recent,
     _format_created_summary,
+    _looks_like_feedback_command,
     _resolve_pending_without_ai,
 )
 
@@ -406,6 +409,15 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result.goods[0].price, 20000.0)
         self.assertEqual(result.goods[0].currency, "MXN")
 
+    def test_bare_tire_is_goods_without_pending_fields(self):
+        client = OpenAIClient("", "unused", "unused")
+        result = client._fallback("Покрышка 26x2", today="2026-05-20")
+        self.assertEqual(result.tasks, [])
+        self.assertEqual(result.studies, [])
+        self.assertEqual(len(result.goods), 1)
+        self.assertEqual(result.goods[0].title, "Покрышка 26x2")
+        self.assertEqual(result.goods[0].missing, [])
+
     def test_fallback_does_not_create_goods_for_meeting_request(self):
         client = OpenAIClient("", "unused", "unused")
         for text in (
@@ -646,6 +658,37 @@ class ModelsTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Goods title is required"):
             client.create_goods(item, projects=[])
 
+    def test_system_issue_notion_property_mapping(self):
+        issue = SystemIssueRecord(
+            classification=SystemIssueClassification(
+                issue_type="Неверная классификация",
+                severity="Средняя",
+                database="BUY",
+                actual_result="Создана задача",
+                expected_result="Нужно было создать товар",
+                probable_cause="Требуется анализ",
+                title="Покрышка 26x2",
+            ),
+            detection_method="Пользователь",
+            status="Новая",
+            input_data="Исходное сообщение: Покрышка 26x2",
+            description="Что произошло: Создана задача",
+            solution="Требуется анализ и исправление",
+            detected_date="2026-05-20",
+            fingerprint="fp",
+        )
+        properties = _system_issue_properties(issue)
+        self.assertEqual(
+            properties["Краткое описание ошибки"],
+            {"title": [{"type": "text", "text": {"content": "Неверная классификация: Покрышка 26x2"}}]},
+        )
+        self.assertEqual(properties["Тип ошибки"], {"select": {"name": "Неверная классификация"}})
+        self.assertEqual(properties["Статус"], {"select": {"name": "Новая"}})
+        self.assertEqual(properties["Критичность"], {"select": {"name": "Средняя"}})
+        self.assertEqual(properties["Способ обнаружения"], {"select": {"name": "Пользователь"}})
+        self.assertEqual(properties["База данных"], {"select": {"name": "BUY"}})
+        self.assertEqual(properties["Дата обнаружения"], {"date": {"start": "2026-05-20"}})
+
     def test_goods_notion_error_does_not_break_task_or_study(self):
         service = object.__new__(ConductorService)
         service.settings = Mock(confidence_threshold=0.70)
@@ -767,6 +810,92 @@ class ModelsTest(unittest.TestCase):
         self.assertIn("Не удалось создать товар 'Ноутбук'", messages[0])
         self.assertIn("Добавила задачу: Написать Марко", messages[1])
         self.assertNotIn("Создан товар", messages[1])
+
+    def test_feedback_detection(self):
+        for text in ("Неправильно", "Неверно", "Ошибка", "Не так", "/wrong", "/error"):
+            with self.subTest(text=text):
+                self.assertTrue(_looks_like_feedback_command(text))
+        self.assertFalse(_looks_like_feedback_command("Нужен ноутбук"))
+
+    def test_interaction_store_tracks_latest_and_feedback(self):
+        with TemporaryDirectory() as tmp:
+            store = InteractionStore(f"{tmp}/interactions.json")
+            first = store.create(42, text="Нужен ноутбук", telegram_message_id=10, model="m")
+            store.update(first, status="completed")
+            self.assertEqual(store.latest_for_chat(42)["interaction_id"], first)
+            self.assertEqual(store.find_by_reply(42, 10)["interaction_id"], first)
+            store.start_feedback(42, command="/wrong", interaction=store.latest_for_chat(42))
+            self.assertEqual(store.get_feedback(42)["state"], "awaiting_correction")
+
+    def test_feedback_command_does_not_consume_pending_or_classifier(self):
+        with TemporaryDirectory() as tmp:
+            service = object.__new__(ConductorService)
+            service.interactions = InteractionStore(f"{tmp}/interactions.json")
+            service.pending = Mock()
+            service.openai = Mock()
+            service.notion = Mock()
+            service.telegram = Mock()
+
+            result = service.process_text("Неправильно", chat_id=42)
+
+            self.assertEqual(result["notes"], ["feedback correction requested"])
+            service.pending.pop_oldest_for_chat.assert_not_called()
+            service.openai.classify.assert_not_called()
+            self.assertIn("Что должно было произойти", service.telegram.send_message.call_args.args[1])
+
+    def test_feedback_correction_creates_system_issue(self):
+        with TemporaryDirectory() as tmp:
+            service = object.__new__(ConductorService)
+            service.interactions = InteractionStore(f"{tmp}/interactions.json")
+            interaction_id = service.interactions.create(42, text="Покрышка 26x2", telegram_message_id=10, model="m")
+            service.interactions.update(interaction_id, classification={"tasks": [], "studies": [], "goods": []})
+            service.pending = Mock()
+            service.openai = OpenAIClient("", "unused", "unused")
+            service.notion = Mock()
+            service.notion.create_system_issue.return_value = "issue-url"
+            service.telegram = Mock()
+
+            service.process_text("/wrong", chat_id=42, reply_to_message_id=10)
+            result = service.process_text("Это товар BUY", chat_id=42)
+
+            self.assertEqual(result["notes"], ["feedback issue saved"])
+            issue = service.notion.create_system_issue.call_args.args[0]
+            self.assertEqual(issue.classification.issue_type, "Неверная классификация")
+            self.assertEqual(issue.classification.database, "BUY")
+            self.assertIn("Исправить запись сейчас", service.telegram.send_message.call_args.args[1])
+
+    def test_feedback_yes_reprocesses_original_with_correction(self):
+        service = object.__new__(ConductorService)
+        service.interactions = Mock()
+        service.interactions.pop_feedback.return_value = None
+        service.process_text = Mock(return_value={"tasks_created": [], "studies_created": [], "goods_created": ["goods-url"], "pending": 0, "errors": [], "notes": []})
+        feedback = {
+            "state": "awaiting_fix_confirmation",
+            "interaction": {"input_text": "Покрышка 26x2"},
+            "correction": "Это товар",
+        }
+
+        result = ConductorService._handle_feedback_followup(service, "Да", chat_id=42, source="Telegram", feedback=feedback)
+
+        self.assertEqual(result["goods_created"], ["goods-url"])
+        service.process_text.assert_called_once()
+        args, kwargs = service.process_text.call_args
+        self.assertIn("Покрышка 26x2", args[0])
+        self.assertIn("Исправление пользователя: Это товар", args[0])
+        self.assertTrue(kwargs["skip_feedback"])
+
+    def test_automatic_issue_deduplicates_by_fingerprint(self):
+        with TemporaryDirectory() as tmp:
+            service = object.__new__(ConductorService)
+            service.interactions = InteractionStore(f"{tmp}/interactions.json")
+            service.openai = OpenAIClient("", "unused", "unused")
+            service.notion = Mock()
+            service.notion.create_system_issue.return_value = "issue-url"
+
+            service._record_automatic_issue("Notion failure", input_text="Нужен ноутбук", errors=["HTTP 500"], interaction_id=None)
+            service._record_automatic_issue("Notion failure", input_text="Нужен ноутбук", errors=["HTTP 500"], interaction_id=None)
+
+            service.notion.create_system_issue.assert_called_once()
 
     def test_edit_request_without_pending_returns_guidance(self):
         service = object.__new__(ConductorService)

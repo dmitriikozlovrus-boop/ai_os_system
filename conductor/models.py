@@ -23,6 +23,41 @@ GOODS_TYPES = {
 GOODS_CURRENCIES = {"MXN", "USD", "EUR", "RUB"}
 GOODS_USERS = {"Личное", "Семья", "Ребёнок", "Партнёр/партнёрша", "Дом", "Работа", "Подарок", "Другое"}
 GOODS_USAGE_PLACES = {"Дом", "Офис", "Поездки", "Подарок", "Другое"}
+SYSTEM_ISSUE_TYPES = {
+    "Неверная классификация",
+    "Неверная база",
+    "Неверное извлечение поля",
+    "Неверная дата",
+    "Неверное время",
+    "Неверная длительность",
+    "Потеря информации",
+    "Создан дубликат",
+    "Обновлена не та запись",
+    "Не создана нужная запись",
+    "Не обновлена нужная запись",
+    "Неверная связь",
+    "Отсутствующая связь",
+    "Галлюцинация значения",
+    "Игнорирование команды",
+    "Неверное выполнение команды",
+    "Неполный отчёт",
+    "Другое",
+}
+SYSTEM_ISSUE_SEVERITIES = {"Высокая", "Средняя", "Низкая"}
+SYSTEM_ISSUE_DATABASES = {
+    "TASKS",
+    "PROBLEMS",
+    "Study / На изучение",
+    "EVENTS",
+    "IDEAS",
+    "COMMUNICATIONS",
+    "CONTACTS",
+    "FILMS",
+    "BOOKS",
+    "BUY",
+    "SUBSCRIPTIONS",
+    "Другое",
+}
 
 
 @dataclass
@@ -80,6 +115,29 @@ class Classification:
     studies: list[StudyItem]
     goods: list[GoodsItem] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SystemIssueClassification:
+    issue_type: str
+    severity: str
+    database: str
+    actual_result: str
+    expected_result: str
+    probable_cause: str
+    title: str
+
+
+@dataclass
+class SystemIssueRecord:
+    classification: SystemIssueClassification
+    detection_method: str
+    status: str
+    input_data: str
+    description: str
+    solution: str
+    detected_date: str
+    fingerprint: str
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -188,3 +246,18 @@ def classification_from_dict(data: dict[str, Any]) -> Classification:
         )
 
     return Classification(tasks=tasks, studies=studies, goods=goods, notes=[str(x) for x in data.get("notes", [])])
+
+
+def system_issue_classification_from_dict(data: dict[str, Any]) -> SystemIssueClassification:
+    issue_type = str(data.get("issue_type") or "Неверная классификация").strip()
+    severity = str(data.get("severity") or "Средняя").strip()
+    database = str(data.get("database") or "Другое").strip()
+    return SystemIssueClassification(
+        issue_type=issue_type if issue_type in SYSTEM_ISSUE_TYPES else "Другое",
+        severity=severity if severity in SYSTEM_ISSUE_SEVERITIES else "Средняя",
+        database=database if database in SYSTEM_ISSUE_DATABASES else "Другое",
+        actual_result=str(data.get("actual_result") or "").strip(),
+        expected_result=str(data.get("expected_result") or "").strip(),
+        probable_cause=str(data.get("probable_cause") or "Требуется анализ").strip() or "Требуется анализ",
+        title=str(data.get("title") or "").strip(),
+    )

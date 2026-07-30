@@ -14,8 +14,12 @@ from .models import (
     GOODS_USAGE_PLACES,
     GOODS_USERS,
     PROJECT_PRIORITIES,
+    SYSTEM_ISSUE_DATABASES,
+    SYSTEM_ISSUE_SEVERITIES,
+    SYSTEM_ISSUE_TYPES,
     Classification,
     classification_from_dict,
+    system_issue_classification_from_dict,
 )
 
 
@@ -164,6 +168,30 @@ CLASSIFIER_SCHEMA: dict[str, Any] = {
 }
 
 
+SYSTEM_ISSUE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "issue_type": {"type": "string", "enum": sorted(SYSTEM_ISSUE_TYPES)},
+        "severity": {"type": "string", "enum": sorted(SYSTEM_ISSUE_SEVERITIES)},
+        "database": {"type": "string", "enum": sorted(SYSTEM_ISSUE_DATABASES)},
+        "actual_result": {"type": "string"},
+        "expected_result": {"type": "string"},
+        "probable_cause": {"type": "string"},
+        "title": {"type": "string"},
+    },
+    "required": [
+        "issue_type",
+        "severity",
+        "database",
+        "actual_result",
+        "expected_result",
+        "probable_cause",
+        "title",
+    ],
+}
+
+
 class OpenAIClient:
     def __init__(self, api_key: str, model: str, transcribe_model: str, transcribe_fallback_model: str | None = None):
         self.api_key = api_key
@@ -271,6 +299,59 @@ class OpenAIClient:
                 errors.append(f"{model}: {exc}")
         raise RuntimeError(" ; ".join(errors) if errors else "voice transcription failed")
 
+    def classify_system_issue(
+        self,
+        *,
+        original_text: str,
+        actual_context: dict[str, Any],
+        command: str,
+        correction: str,
+    ):
+        if not self.api_key:
+            return _fallback_system_issue_classification(original_text, actual_context, correction)
+        system = (
+            "Ты классификатор системных ошибок сервиса 'Дирижер'. "
+            "Верни только тип ошибки, критичность, базу, фактический результат, ожидаемый результат, причину и короткий title. "
+            "Не используй классификацию Task/Study/Goods."
+        )
+        payload = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "original_text": original_text,
+                            "actual_context": actual_context,
+                            "feedback_command": command,
+                            "user_correction": correction,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "conductor_system_issue",
+                    "schema": SYSTEM_ISSUE_SCHEMA,
+                    "strict": True,
+                }
+            },
+        }
+        try:
+            data = request_json(
+                "POST",
+                "https://api.openai.com/v1/responses",
+                headers={**self.headers, "Content-Type": "application/json"},
+                payload=payload,
+                timeout=90,
+            )
+            return system_issue_classification_from_dict(json.loads(_extract_response_text(data)))
+        except Exception:
+            return _fallback_system_issue_classification(original_text, actual_context, correction)
+
     def _transcription_models(self) -> list[str]:
         models = [self.transcribe_model]
         if self.transcribe_fallback_model and self.transcribe_fallback_model not in models:
@@ -312,6 +393,7 @@ class OpenAIClient:
             "выбери",
             "заказать",
             "закажи",
+            "покрыш",
         )
         lower = text.lower()
         data: dict[str, Any] = {"tasks": [], "studies": [], "goods": [], "notes": [note]}
@@ -741,6 +823,73 @@ def _ensure_missing(missing: list[str], field: str, *, when: bool = True) -> Non
 
 def _valid_url(value: str | None) -> bool:
     return bool(value and re.match(r"^https?://[^\s]+$", value))
+
+
+def _fallback_system_issue_classification(original_text: str, actual_context: dict[str, Any], correction: str):
+    from .models import SystemIssueClassification
+
+    lower = correction.casefold()
+    issue_type = "Неверная классификация"
+    if "цен" in lower or "валют" in lower or "пол" in lower:
+        issue_type = "Неверное извлечение поля"
+    if "баз" in lower:
+        issue_type = "Неверная база"
+    if "не созд" in lower or "нужно было создать" in lower:
+        issue_type = "Не создана нужная запись"
+    if "дублик" in lower:
+        issue_type = "Создан дубликат"
+    if "потер" in lower:
+        issue_type = "Потеря информации"
+
+    severity = "Средняя"
+    if issue_type in {"Потеря информации", "Обновлена не та запись"}:
+        severity = "Высокая"
+    if "лишн" in lower or "уточнен" in lower or "вопрос" in lower:
+        severity = "Низкая"
+
+    database = "Другое"
+    combined = f"{original_text} {correction}".casefold()
+    if "товар" in combined or "goods" in combined or "покуп" in combined or "покрыш" in combined:
+        database = "BUY"
+    elif "study" in combined or "изуч" in combined:
+        database = "Study / На изучение"
+    elif "task" in combined or "задач" in combined:
+        database = "TASKS"
+
+    title = original_text.strip()[:120] or correction.strip()[:120] or "Ошибка Дирижера"
+    return SystemIssueClassification(
+        issue_type=issue_type,
+        severity=severity,
+        database=database,
+        actual_result=_summarize_actual_context(actual_context),
+        expected_result=correction.strip(),
+        probable_cause="Требуется анализ",
+        title=title,
+    )
+
+
+def _summarize_actual_context(actual_context: dict[str, Any]) -> str:
+    parts = []
+    if actual_context.get("classification"):
+        classification = actual_context["classification"]
+        parts.append(
+            "classification="
+            + json.dumps(
+                {
+                    "tasks": len(classification.get("tasks", [])),
+                    "studies": len(classification.get("studies", [])),
+                    "goods": len(classification.get("goods", [])),
+                },
+                ensure_ascii=False,
+            )
+        )
+    if actual_context.get("created"):
+        parts.append("created=" + json.dumps(actual_context["created"], ensure_ascii=False))
+    if actual_context.get("pending"):
+        parts.append("pending=" + json.dumps(actual_context["pending"], ensure_ascii=False))
+    if actual_context.get("errors"):
+        parts.append("errors=" + json.dumps(actual_context["errors"], ensure_ascii=False))
+    return "; ".join(parts) or "Требуется анализ"
 
 
 def _normalize_birthday_task_title(title: str, description: str) -> str:

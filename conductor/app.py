@@ -108,6 +108,10 @@ def handle_update(update: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "ignored": True}
     chat_id = int(message["chat"]["id"])
     text, file_info = extract_text_and_file(message)
+    message_id = message.get("message_id")
+    reply_to_message_id = None
+    if isinstance(message.get("reply_to_message"), dict):
+        reply_to_message_id = message["reply_to_message"].get("message_id")
 
     if file_info and file_info.get("kind") in {"voice", "audio"}:
         file_path, data = service.telegram.get_file_bytes(file_info["file_id"])
@@ -118,7 +122,12 @@ def handle_update(update: dict[str, Any]) -> dict[str, Any]:
         service.telegram.send_message(chat_id, "Пока MVP обрабатывает текст и голос. Для фото/документов добавь подпись текстом.")
         return {"ok": True, "message": "unsupported without text"}
 
-    return service.process_text(text, chat_id=chat_id)
+    return service.process_text(
+        text,
+        chat_id=chat_id,
+        telegram_message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+    )
 
 
 def main() -> None:
