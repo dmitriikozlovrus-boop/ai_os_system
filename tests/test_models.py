@@ -838,10 +838,10 @@ class ModelsTest(unittest.TestCase):
 
             result = service.process_text("Неправильно", chat_id=42)
 
-            self.assertEqual(result["notes"], ["feedback correction requested"])
+            self.assertEqual(result["notes"], ["feedback context requested"])
             service.pending.pop_oldest_for_chat.assert_not_called()
             service.openai.classify.assert_not_called()
-            self.assertIn("Что должно было произойти", service.telegram.send_message.call_args.args[1])
+            self.assertIn("не смогла определить", service.telegram.send_message.call_args.args[1])
 
     def test_feedback_correction_creates_system_issue(self):
         with TemporaryDirectory() as tmp:
@@ -868,6 +868,7 @@ class ModelsTest(unittest.TestCase):
         service = object.__new__(ConductorService)
         service.interactions = Mock()
         service.interactions.pop_feedback.return_value = None
+        service.telegram = Mock()
         service.process_text = Mock(return_value={"tasks_created": [], "studies_created": [], "goods_created": ["goods-url"], "pending": 0, "errors": [], "notes": []})
         feedback = {
             "state": "awaiting_fix_confirmation",

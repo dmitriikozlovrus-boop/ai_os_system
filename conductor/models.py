@@ -58,6 +58,16 @@ SYSTEM_ISSUE_DATABASES = {
     "SUBSCRIPTIONS",
     "Другое",
 }
+CORRECTION_INTENTS = {
+    "CHANGE_ENTITY_TYPE",
+    "CHANGE_FIELDS",
+    "DELETE_OR_CANCEL",
+    "CREATE_MISSING_RECORD",
+    "UPDATE_WRONG_RECORD",
+    "NO_ACTION_EXPECTED",
+    "UNKNOWN",
+}
+CORRECTION_TARGET_TYPES = {"Task", "Study", "Goods", "Event", "Other", "None", "Unknown"}
 
 
 @dataclass
@@ -126,6 +136,12 @@ class SystemIssueClassification:
     expected_result: str
     probable_cause: str
     title: str
+    correction_intent: str = "UNKNOWN"
+    correction_target_type: str = "Unknown"
+    corrected_fields: list[str] = field(default_factory=list)
+    should_delete_original: bool = False
+    needs_user_clarification: bool = False
+    clarification_question: str = ""
 
 
 @dataclass
@@ -252,6 +268,8 @@ def system_issue_classification_from_dict(data: dict[str, Any]) -> SystemIssueCl
     issue_type = str(data.get("issue_type") or "Неверная классификация").strip()
     severity = str(data.get("severity") or "Средняя").strip()
     database = str(data.get("database") or "Другое").strip()
+    correction_intent = str(data.get("correction_intent") or "UNKNOWN").strip()
+    correction_target_type = str(data.get("correction_target_type") or "Unknown").strip()
     return SystemIssueClassification(
         issue_type=issue_type if issue_type in SYSTEM_ISSUE_TYPES else "Другое",
         severity=severity if severity in SYSTEM_ISSUE_SEVERITIES else "Средняя",
@@ -260,4 +278,10 @@ def system_issue_classification_from_dict(data: dict[str, Any]) -> SystemIssueCl
         expected_result=str(data.get("expected_result") or "").strip(),
         probable_cause=str(data.get("probable_cause") or "Требуется анализ").strip() or "Требуется анализ",
         title=str(data.get("title") or "").strip(),
+        correction_intent=correction_intent if correction_intent in CORRECTION_INTENTS else "UNKNOWN",
+        correction_target_type=correction_target_type if correction_target_type in CORRECTION_TARGET_TYPES else "Unknown",
+        corrected_fields=[str(value) for value in data.get("corrected_fields", [])],
+        should_delete_original=bool(data.get("should_delete_original", False)),
+        needs_user_clarification=bool(data.get("needs_user_clarification", False)),
+        clarification_question=str(data.get("clarification_question") or "").strip(),
     )

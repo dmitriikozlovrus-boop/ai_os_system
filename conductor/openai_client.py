@@ -8,6 +8,8 @@ from typing import Any
 from .http import HttpError, request_json, request_multipart
 from .models import (
     AREAS,
+    CORRECTION_INTENTS,
+    CORRECTION_TARGET_TYPES,
     GOODS_CURRENCIES,
     GOODS_STATUSES,
     GOODS_TYPES,
@@ -179,6 +181,12 @@ SYSTEM_ISSUE_SCHEMA: dict[str, Any] = {
         "expected_result": {"type": "string"},
         "probable_cause": {"type": "string"},
         "title": {"type": "string"},
+        "correction_intent": {"type": "string", "enum": sorted(CORRECTION_INTENTS)},
+        "correction_target_type": {"type": "string", "enum": sorted(CORRECTION_TARGET_TYPES)},
+        "corrected_fields": {"type": "array", "items": {"type": "string"}},
+        "should_delete_original": {"type": "boolean"},
+        "needs_user_clarification": {"type": "boolean"},
+        "clarification_question": {"type": "string"},
     },
     "required": [
         "issue_type",
@@ -188,6 +196,12 @@ SYSTEM_ISSUE_SCHEMA: dict[str, Any] = {
         "expected_result",
         "probable_cause",
         "title",
+        "correction_intent",
+        "correction_target_type",
+        "corrected_fields",
+        "should_delete_original",
+        "needs_user_clarification",
+        "clarification_question",
     ],
 }
 
@@ -312,6 +326,8 @@ class OpenAIClient:
         system = (
             "Ты классификатор системных ошибок сервиса 'Дирижер'. "
             "Верни только тип ошибки, критичность, базу, фактический результат, ожидаемый результат, причину и короткий title. "
+            "Также определи intent исправления: CHANGE_ENTITY_TYPE, CHANGE_FIELDS, DELETE_OR_CANCEL, "
+            "CREATE_MISSING_RECORD, UPDATE_WRONG_RECORD, NO_ACTION_EXPECTED или UNKNOWN. "
             "Не используй классификацию Task/Study/Goods."
         )
         payload = {
@@ -840,6 +856,10 @@ def _fallback_system_issue_classification(original_text: str, actual_context: di
         issue_type = "Создан дубликат"
     if "потер" in lower:
         issue_type = "Потеря информации"
+    if "не ту" in lower or "не та" in lower:
+        issue_type = "Обновлена не та запись"
+    if "ничего создавать" in lower or "не надо создавать" in lower or "не нужно создавать" in lower:
+        issue_type = "Неверное выполнение команды"
 
     severity = "Средняя"
     if issue_type in {"Потеря информации", "Обновлена не та запись"}:
@@ -856,6 +876,35 @@ def _fallback_system_issue_classification(original_text: str, actual_context: di
     elif "task" in combined or "задач" in combined:
         database = "TASKS"
 
+    correction_intent = "UNKNOWN"
+    target_type = "Unknown"
+    corrected_fields: list[str] = []
+    if any(marker in lower for marker in ("это задача", "нужно было создать задачу")):
+        correction_intent = "CHANGE_ENTITY_TYPE"
+        target_type = "Task"
+    elif any(marker in lower for marker in ("это товар", "goods", "buy")):
+        correction_intent = "CHANGE_ENTITY_TYPE"
+        target_type = "Goods"
+    elif any(marker in lower for marker in ("это исследование", "это study", "на изучение")):
+        correction_intent = "CHANGE_ENTITY_TYPE"
+        target_type = "Study"
+    elif any(marker in lower for marker in ("ничего создавать", "не надо создавать", "не нужно создавать", "просто комментарий")):
+        correction_intent = "NO_ACTION_EXPECTED"
+        target_type = "None"
+    elif "ты не создал" in lower or "ты не создала" in lower or "не создан" in lower:
+        correction_intent = "CREATE_MISSING_RECORD"
+    elif "не ту" in lower or "не та" in lower:
+        correction_intent = "UPDATE_WRONG_RECORD"
+    elif any(marker in lower for marker in ("дата", "завтра", "сегодня", "послезавтра")):
+        correction_intent = "CHANGE_FIELDS"
+        corrected_fields.append("date")
+    elif any(marker in lower for marker in ("время", "15:00", "час")):
+        correction_intent = "CHANGE_FIELDS"
+        corrected_fields.append("time")
+    elif "проект" in lower:
+        correction_intent = "CHANGE_FIELDS"
+        corrected_fields.append("project")
+
     title = original_text.strip()[:120] or correction.strip()[:120] or "Ошибка Дирижера"
     return SystemIssueClassification(
         issue_type=issue_type,
@@ -863,8 +912,14 @@ def _fallback_system_issue_classification(original_text: str, actual_context: di
         database=database,
         actual_result=_summarize_actual_context(actual_context),
         expected_result=correction.strip(),
-        probable_cause="Требуется анализ",
+        probable_cause="Техническая причина требует анализа",
         title=title,
+        correction_intent=correction_intent,
+        correction_target_type=target_type,
+        corrected_fields=corrected_fields,
+        should_delete_original=correction_intent in {"DELETE_OR_CANCEL", "NO_ACTION_EXPECTED"},
+        needs_user_clarification=correction_intent == "UNKNOWN",
+        clarification_question="Как должно было быть правильно?" if correction_intent == "UNKNOWN" else "",
     )
 
 

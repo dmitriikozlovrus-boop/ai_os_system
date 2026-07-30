@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date
 from typing import Any
 
@@ -78,8 +79,28 @@ class ConductorService:
             feedback = self.interactions.get_feedback(chat_id)
             if feedback:
                 return self._handle_feedback_followup(text, chat_id=chat_id, source=source, feedback=feedback)
+            reply_interaction = self.interactions.find_by_reply(chat_id, reply_to_message_id)
+            latest_interaction = self.interactions.latest_for_chat(chat_id)
+            if reply_interaction and _looks_like_feedback(text, has_context=True, is_reply=True):
+                return self._capture_feedback(
+                    text,
+                    chat_id=chat_id,
+                    source=source,
+                    interaction=reply_interaction,
+                    command=text,
+                )
             if _looks_like_feedback_command(text):
                 return self._start_feedback_flow(text, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
+            if _looks_like_feedback(text, has_context=bool(latest_interaction), is_reply=False):
+                if latest_interaction:
+                    return self._capture_feedback(
+                        text,
+                        chat_id=chat_id,
+                        source=source,
+                        interaction=latest_interaction,
+                        command=text,
+                    )
+                return self._start_feedback_flow(text, chat_id=chat_id, reply_to_message_id=None, no_context=True)
 
         interaction_id = None
         if chat_id is not None and hasattr(self, "interactions"):
@@ -126,7 +147,7 @@ class ConductorService:
                 interaction_id=interaction_id,
             )
             if chat_id is not None:
-                self.telegram.send_message(chat_id, f"Не смог разобрать сообщение через AI: {exc}")
+                self._send_message(chat_id, f"Не смог разобрать сообщение через AI: {exc}", interaction_id=interaction_id)
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": []}
         if pending_item:
             classification = _apply_clarification_fallbacks(classification)
@@ -155,7 +176,7 @@ class ConductorService:
             text = self.openai.transcribe(filename, data, content_type)
         except Exception as exc:  # noqa: BLE001 - voice failures should be visible to the user.
             if chat_id is not None:
-                self.telegram.send_message(
+                self._send_message(
                     chat_id,
                     f"Не смогла расшифровать голосовое: {exc}. Пока можно прислать текстом, а я продолжу разбор.",
                 )
@@ -167,7 +188,7 @@ class ConductorService:
     def _handle_edit_request(self, text: str, *, chat_id: int) -> dict[str, Any]:
         recent = self.recent.get(chat_id)
         if not recent:
-            self.telegram.send_message(chat_id, _edit_guidance_message())
+            self._send_message(chat_id, _edit_guidance_message())
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
         try:
             projects = self.notion.list_projects()
@@ -177,7 +198,7 @@ class ConductorService:
 
         updated = _apply_edit_to_recent(recent, text, today=date.today().isoformat(), projects=projects)
         if not updated:
-            self.telegram.send_message(chat_id, _edit_guidance_message())
+            self._send_message(chat_id, _edit_guidance_message())
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["edit guidance sent"]}
 
         try:
@@ -190,10 +211,10 @@ class ConductorService:
                 self.notion.update_study(updated["page_id"], item)
                 classification = Classification(tasks=[], studies=[item], notes=["edited recent study"])
         except Exception as exc:  # noqa: BLE001
-            self.telegram.send_message(chat_id, f"Не смогла обновить запись: {exc}")
+            self._send_message(chat_id, f"Не смогла обновить запись: {exc}")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [str(exc)], "notes": ["edit failed"]}
         self.recent.save(chat_id, updated)
-        self.telegram.send_message(chat_id, _format_updated_summary(classification))
+        self._send_message(chat_id, _format_updated_summary(classification))
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": classification.notes}
 
     def _handle_classification(
@@ -224,7 +245,7 @@ class ConductorService:
                     self.interactions.append(interaction_id, "pending", {"type": "task", "item": item.__dict__})
                     self.interactions.append(interaction_id, "questions", questions)
                 pending_count += 1
-                self.telegram.send_message(chat_id, _format_questions(item.title, questions))
+                self._send_message(chat_id, _format_questions(item.title, questions), interaction_id=interaction_id)
                 continue
             try:
                 url = self.notion.create_task(item, source=source, projects=projects)
@@ -243,7 +264,7 @@ class ConductorService:
                     self.interactions.append(interaction_id, "pending", {"type": "study", "item": item.__dict__})
                     self.interactions.append(interaction_id, "questions", questions)
                 pending_count += 1
-                self.telegram.send_message(chat_id, _format_questions(item.question, questions))
+                self._send_message(chat_id, _format_questions(item.question, questions), interaction_id=interaction_id)
                 continue
             try:
                 url = self.notion.create_study(item)
@@ -262,7 +283,7 @@ class ConductorService:
                     self.interactions.append(interaction_id, "pending", {"type": "goods", "item": item.__dict__})
                     self.interactions.append(interaction_id, "questions", questions)
                 pending_count += 1
-                self.telegram.send_message(chat_id, _format_questions(item.title or "Товар", questions))
+                self._send_message(chat_id, _format_questions(item.title or "Товар", questions), interaction_id=interaction_id)
                 continue
             try:
                 url = self.notion.create_goods(item, projects=projects)
@@ -274,7 +295,7 @@ class ConductorService:
                 errors.append(f"Не удалось создать товар '{item.title}': {exc}")
 
         if chat_id is not None and errors:
-            self.telegram.send_message(chat_id, "\n".join(errors))
+            self._send_message(chat_id, "\n".join(errors), interaction_id=interaction_id)
         if chat_id is not None and (created_tasks or created_studies or created_goods):
             created_classification = Classification(
                 tasks=created_task_items,
@@ -282,7 +303,7 @@ class ConductorService:
                 goods=created_goods_items,
                 notes=classification.notes,
             )
-            self.telegram.send_message(chat_id, _format_created_summary(created_classification, from_clarification=from_clarification))
+            self._send_message(chat_id, _format_created_summary(created_classification, from_clarification=from_clarification), interaction_id=interaction_id)
         if interaction_id:
             self.interactions.update(
                 interaction_id,
@@ -301,11 +322,63 @@ class ConductorService:
             "notes": classification.notes,
         }
 
-    def _start_feedback_flow(self, command: str, *, chat_id: int, reply_to_message_id: int | None) -> dict[str, Any]:
+    def _start_feedback_flow(
+        self,
+        command: str,
+        *,
+        chat_id: int,
+        reply_to_message_id: int | None,
+        no_context: bool = False,
+    ) -> dict[str, Any]:
         interaction = self.interactions.find_by_reply(chat_id, reply_to_message_id) or self.interactions.latest_for_chat(chat_id)
+        if no_context or not interaction:
+            self.interactions.start_feedback(chat_id, command=command, interaction=None, state="awaiting_orphan_correction")
+            self._send_message(chat_id, _feedback_no_context_prompt())
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback context requested"]}
         self.interactions.start_feedback(chat_id, command=command, interaction=interaction)
-        self.telegram.send_message(chat_id, _feedback_prompt())
+        self._send_message(chat_id, _feedback_prompt())
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback correction requested"]}
+
+    def _capture_feedback(
+        self,
+        correction: str,
+        *,
+        chat_id: int,
+        source: str,
+        interaction: dict[str, Any],
+        command: str,
+    ) -> dict[str, Any]:
+        issue = self._build_system_issue(
+            command=command,
+            correction=correction.strip(),
+            interaction=interaction,
+            detection_method="Пользователь",
+        )
+        errors: list[str] = []
+        try:
+            issue_url = self.notion.create_system_issue(issue)
+        except Exception as exc:  # noqa: BLE001
+            print(f"ISSUE_CAPTURE_ERROR feedback: {exc}", flush=True)
+            errors.append(str(exc))
+            self._send_message(chat_id, f"Не смогла сохранить ошибку в SYSTEM ISSUES: {_safe_error(exc)}")
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": errors, "notes": ["feedback issue save failed"]}
+
+        if issue.classification.needs_user_clarification:
+            self.interactions.start_feedback(chat_id, command=command, interaction=interaction, state="awaiting_correction")
+            self._send_message(chat_id, _format_issue_needs_clarification(issue))
+            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback clarification requested"], "issue_url": issue_url}
+
+        feedback = {
+            "state": "awaiting_fix_confirmation",
+            "command": command,
+            "correction": correction.strip(),
+            "interaction": interaction,
+            "issue": _issue_payload(issue),
+            "issue_url": issue_url,
+        }
+        self.interactions.update_feedback(chat_id, feedback)
+        self._send_message(chat_id, _format_issue_saved(issue))
+        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback issue saved"], "issue_url": issue_url}
 
     def _handle_feedback_followup(
         self,
@@ -322,30 +395,29 @@ class ConductorService:
                 original = str((feedback.get("interaction") or {}).get("input_text") or "")
                 correction = str(feedback.get("correction") or "")
                 merged = f"{original}\n\nИсправление пользователя: {correction}".strip()
-                return self.process_text(merged, chat_id=chat_id, source=source, skip_feedback=True)
-            self.telegram.send_message(chat_id, "Хорошо, запись сейчас не исправляю.")
+                result = self.process_text(merged, chat_id=chat_id, source=source, skip_feedback=True)
+                if not result.get("errors") and feedback.get("issue_url"):
+                    try:
+                        self.notion.update_system_issue(
+                            _extract_notion_page_id(str(feedback["issue_url"])),
+                            solution="Запись исправлена через Telegram feedback flow",
+                            status="В анализе",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"ISSUE_CAPTURE_ERROR update: {exc}", flush=True)
+                self._send_message(chat_id, _format_fix_completed(result))
+                return result
+            self._send_message(chat_id, "Хорошо, запись сейчас не исправляю.")
             return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback fix declined"]}
 
         interaction = feedback.get("interaction") or {}
-        correction = text.strip()
-        issue = self._build_system_issue(
-            command=str(feedback.get("command") or ""),
-            correction=correction,
+        return self._capture_feedback(
+            text,
+            chat_id=chat_id,
+            source=source,
             interaction=interaction,
-            detection_method="Пользователь",
+            command=str(feedback.get("command") or ""),
         )
-        errors: list[str] = []
-        try:
-            self.notion.create_system_issue(issue)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc))
-        feedback.update({"state": "awaiting_fix_confirmation", "correction": correction, "issue": _issue_payload(issue)})
-        self.interactions.update_feedback(chat_id, feedback)
-        if errors:
-            self.telegram.send_message(chat_id, f"Не смогла сохранить ошибку в SYSTEM ISSUES: {errors[0]}")
-            return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": errors, "notes": ["feedback issue save failed"]}
-        self.telegram.send_message(chat_id, _format_issue_saved(issue))
-        return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback issue saved"]}
 
     def _build_system_issue(
         self,
@@ -408,8 +480,18 @@ class ConductorService:
             if interaction_id:
                 self.interactions.append(interaction_id, "system_issues", {"fingerprint": fingerprint, "title": title})
         except Exception as exc:  # noqa: BLE001
+            print(f"PRIMARY_ERROR {title}: {'; '.join(errors)}", flush=True)
+            print(f"ISSUE_CAPTURE_ERROR automatic: {exc}", flush=True)
             if interaction_id:
                 self.interactions.append(interaction_id, "errors", f"Could not record system issue: {exc}")
+
+    def _send_message(self, chat_id: int, text: str, *, interaction_id: str | None = None) -> None:
+        result = self.telegram.send_message(chat_id, text)
+        if interaction_id and hasattr(self, "interactions"):
+            self.interactions.append(interaction_id, "bot_messages", text)
+            message_id = _extract_telegram_message_id(result)
+            if message_id is not None:
+                self.interactions.append(interaction_id, "bot_message_ids", message_id)
 
     def _task_questions(self, item: TaskItem) -> list[str]:
         questions: list[str] = []
@@ -456,8 +538,48 @@ def _looks_like_feedback_command(text: str) -> bool:
     return normalized in {"неправильно", "неверно", "ошибка", "не так", "/wrong", "/error"}
 
 
+def _looks_like_feedback(text: str, *, has_context: bool, is_reply: bool) -> bool:
+    normalized = " ".join(text.strip().casefold().split())
+    if not normalized:
+        return False
+    if _looks_like_feedback_command(normalized):
+        return True
+    if normalized in {"да", "нет", "хорошо", "завтра"} or re.fullmatch(r"\d{1,2}:\d{2}", normalized):
+        return False
+    false_positive_patterns = (
+        r"^ошибка\s+\S+",
+        r"^книга\s+называется",
+        r"^изучи\s+ошиб",
+        r"^купить\s+книг",
+        r"^встреча\s+не\s+так\s+важна",
+    )
+    if any(re.search(pattern, normalized) for pattern in false_positive_patterns):
+        return False
+    correction_patterns = (
+        r"^нет,\s*это\s+",
+        r"^это\s+не\s+.+,\s*это\s+",
+        r"^нужно было\s+",
+        r"^правильно будет\s*:",
+        r"^ничего создавать не ",
+        r"^не нужно было\s+",
+        r"^дата\s+(?:неверная|не та|должна)",
+        r"^время\s+(?:неверное|не то|должно)",
+        r"^поставь\s+время",
+        r"^это для проекта\s+",
+        r"^ты не создал",
+        r"^ты не создала",
+        r"^обновила не ту",
+        r"^обновил не ту",
+    )
+    return any(re.search(pattern, normalized) for pattern in correction_patterns)
+
+
 def _looks_like_yes(text: str) -> bool:
-    return text.strip().casefold() in {"да", "yes", "y", "ага", "исправь", "исправить"}
+    return text.strip().casefold() in {"да", "yes", "y", "ага", "исправь", "исправить", "да, исправь"}
+
+
+def _looks_like_no(text: str) -> bool:
+    return text.strip().casefold() in {"нет", "оставь", "не надо", "нет, оставь"}
 
 
 def _feedback_prompt() -> str:
@@ -475,15 +597,45 @@ def _feedback_prompt() -> str:
     )
 
 
+def _feedback_no_context_prompt() -> str:
+    return (
+        "Я зафиксирую ошибку, но не смогла определить, к какой предыдущей записи она относится.\n"
+        "Пришли описание ошибки и правильный вариант одним сообщением."
+    )
+
+
 def _format_issue_saved(issue: SystemIssueRecord) -> str:
     return (
-        "Ошибка сохранена.\n\n"
+        "Ошибка зафиксирована.\n"
         f"Тип: {issue.classification.issue_type}\n"
-        f"База: {issue.classification.database}\n"
-        "Статус: Новая\n\n"
+        f"Критичность: {issue.classification.severity}\n"
+        f"Я поняла правильный результат так:\n{issue.classification.expected_result or 'Требуется уточнение'}\n\n"
         "Исправить запись сейчас?\n"
         "Да\n"
         "Нет"
+    )
+
+
+def _format_issue_needs_clarification(issue: SystemIssueRecord) -> str:
+    question = issue.classification.clarification_question or "Как должно было быть правильно?"
+    return f"Ошибка зафиксирована.\n{question}"
+
+
+def _format_fix_completed(result: dict[str, Any]) -> str:
+    if result.get("errors"):
+        return "Ошибка зафиксирована, но исправить запись автоматически не удалось.\nПричина:\n" + "; ".join(result["errors"])
+    created = []
+    if result.get("tasks_created"):
+        created.append(f"задачи: {len(result['tasks_created'])}")
+    if result.get("studies_created"):
+        created.append(f"исследования: {len(result['studies_created'])}")
+    if result.get("goods_created"):
+        created.append(f"товары: {len(result['goods_created'])}")
+    summary = ", ".join(created) if created else "новых записей нет"
+    return (
+        "Исправление выполнено.\n"
+        f"Создано/обновлено: {summary}\n"
+        "Ошибка оставлена в System Issues для последующего анализа правил."
     )
 
 
@@ -510,21 +662,16 @@ def _issue_payload(issue: SystemIssueRecord) -> dict[str, Any]:
 
 
 def _format_issue_input(original: str, interaction: dict[str, Any], command: str, correction: str) -> str:
-    return "\n".join(
-        [
-            f"Исходное сообщение: {original}",
-            f"Ответ бота: {json.dumps(interaction.get('bot_messages') or [], ensure_ascii=False)}",
-            f"Команда: {command}",
-            f"Ответ пользователя: {correction}",
-        ]
-    )
+    return original or correction
 
 
 def _format_issue_description(classification: Any, interaction: dict[str, Any]) -> str:
     return "\n".join(
         [
-            f"Что произошло: {classification.actual_result or 'Требуется анализ'}",
-            f"Что ожидалось: {classification.expected_result or 'Требуется анализ'}",
+            f"Исходный ввод: {interaction.get('input_text') or 'Не найден'}",
+            f"Фактический результат: {classification.actual_result or 'Требуется анализ'}",
+            f"Обратная связь пользователя: {classification.expected_result or 'Требуется анализ'}",
+            f"Ожидаемый результат: {classification.expected_result or 'Требуется анализ'}",
             f"Какие сущности определены: {json.dumps(interaction.get('classification'), ensure_ascii=False)}",
             f"Какие записи созданы: {json.dumps(interaction.get('created'), ensure_ascii=False)}",
             f"Какие вопросы заданы: {json.dumps(interaction.get('questions') or [], ensure_ascii=False)}",
@@ -534,6 +681,18 @@ def _format_issue_description(classification: Any, interaction: dict[str, Any]) 
 
 def _fingerprint(*parts: str) -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _extract_telegram_message_id(result: Any) -> int | None:
+    if not isinstance(result, dict):
+        return None
+    message = result.get("result") if isinstance(result.get("result"), dict) else result
+    value = message.get("message_id") if isinstance(message, dict) else None
+    return int(value) if isinstance(value, int) else None
+
+
+def _safe_error(exc: Exception) -> str:
+    return str(exc).splitlines()[0][:500]
 
 
 def _edit_guidance_message() -> str:

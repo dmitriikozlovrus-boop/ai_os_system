@@ -102,6 +102,17 @@ class NotionClient:
         data = request_json("POST", "https://api.notion.com/v1/pages", headers=self.headers, payload=payload)
         return data.get("url", "")
 
+    def update_system_issue(self, page_id: str, *, solution: str, status: str | None = None) -> None:
+        properties: dict[str, Any] = {"Решение": _rich_text_prop(solution)}
+        if status:
+            properties["Статус"] = _select_prop(status)
+        request_json(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=self.headers,
+            payload={"properties": properties},
+        )
+
     def update_task(
         self,
         page_id: str,
