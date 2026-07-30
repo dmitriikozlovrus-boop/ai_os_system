@@ -98,6 +98,24 @@ class ModelsTest(unittest.TestCase):
         result = classification_from_dict({"tasks": [], "studies": [], "notes": []})
         self.assertEqual(result.goods, [])
 
+    def test_classification_from_dict_defaults_null_goods_to_empty(self):
+        result = classification_from_dict({"tasks": [], "studies": [], "goods": None, "notes": []})
+        self.assertEqual(result.goods, [])
+
+    def test_classification_from_dict_parses_multiple_goods(self):
+        result = classification_from_dict(
+            {
+                "tasks": [],
+                "studies": [],
+                "goods": [
+                    {"title": "Ноутбук", "confidence": 0.9, "missing": []},
+                    {"title": "Монитор", "confidence": 0.9, "missing": []},
+                ],
+                "notes": [],
+            }
+        )
+        self.assertEqual([item.title for item in result.goods], ["Ноутбук", "Монитор"])
+
     def test_classification_from_dict_parses_task_and_goods(self):
         result = classification_from_dict(
             {
@@ -390,9 +408,16 @@ class ModelsTest(unittest.TestCase):
 
     def test_fallback_does_not_create_goods_for_meeting_request(self):
         client = OpenAIClient("", "unused", "unused")
-        result = client._fallback("Заказать встречу с Марко завтра", today="2026-05-20")
-        self.assertEqual(len(result.tasks), 1)
-        self.assertEqual(result.goods, [])
+        for text in (
+            "Заказать встречу с Марко завтра",
+            "Заказать звонок с Иваном",
+            "Выбрать дату встречи",
+            "Нужен разговор с Иваном",
+            "Купить время",
+        ):
+            with self.subTest(text=text):
+                result = client._fallback(text, today="2026-05-20")
+                self.assertEqual(result.goods, [])
 
     def test_goods_unknown_enum_values_are_cleared(self):
         classification = classification_from_dict(

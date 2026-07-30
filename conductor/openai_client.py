@@ -504,8 +504,10 @@ def _extract_goods_title(text: str) -> str:
 
 def _looks_like_non_goods_request(text: str) -> bool:
     lower = text.casefold()
-    action_markers = ("заказать", "закажи", "выбрать", "выбери")
-    non_goods_markers = ("встреч", "созвон", "звонок")
+    if re.search(r"\bкупить\s+время\b", lower):
+        return True
+    action_markers = ("заказать", "закажи", "выбрать", "выбери", "нужен", "нужна", "нужно")
+    non_goods_markers = ("встреч", "созвон", "звонок", "разговор")
     return any(action in lower for action in action_markers) and any(marker in lower for marker in non_goods_markers)
 
 
