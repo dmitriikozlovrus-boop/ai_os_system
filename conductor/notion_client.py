@@ -71,6 +71,10 @@ class NotionClient:
         return data.get("url", "")
 
     def create_goods(self, item: GoodsItem, *, projects: list[dict[str, str]] | None = None) -> str:
+        if not self.goods_db:
+            raise RuntimeError("NOTION_GOODS_DATABASE_ID is not configured")
+        if not item.title.strip():
+            raise RuntimeError("Goods title is required")
         project_id = self._find_project_id(item.project, projects=projects)
         payload = {
             "parent": {"database_id": self.goods_db},
@@ -172,7 +176,7 @@ def _study_properties(item: StudyItem) -> dict[str, Any]:
 
 def _goods_properties(item: GoodsItem, *, project_id: str | None = None) -> dict[str, Any]:
     properties: dict[str, Any] = {
-        "Наименование предмета": _title_prop(item.title),
+        "Наименование предмета": _title_prop(item.title.strip()),
         "Статус": _status_prop(item.status or "Не куплено"),
         "Источник": _select_prop(item.source or "ИИ"),
     }

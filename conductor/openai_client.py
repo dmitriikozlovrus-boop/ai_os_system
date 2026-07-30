@@ -360,7 +360,7 @@ class OpenAIClient:
                     "missing": _missing(project=project, area=_normalize_area(area), due_date=due_date),
                 }
             )
-        if any(word in lower for word in goods_words):
+        if any(word in lower for word in goods_words) and not _looks_like_non_goods_request(text):
             price, currency = _extract_price_and_currency(text)
             status = (
                 "Необходимо выбрать"
@@ -496,8 +496,17 @@ def _extract_goods_title(text: str) -> str:
     value = re.sub(r"\s+до\s+\d+(?:[\s.,]\d{3})*(?:[.,]\d+)?\s*(?:MXN|USD|EUR|RUB)?", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s+по проекту\s+[^,.]+", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s+направлени[ея]\s+[^,.]+", "", value, flags=re.IGNORECASE)
-    value = _extract_url(value) and value.replace(_extract_url(value) or "", "") or value
+    url = _extract_url(value)
+    if url:
+        value = value.replace(url, "")
     return _capitalize_first_letter(_first_sentence(value).strip(" .,\n\t")[:120])
+
+
+def _looks_like_non_goods_request(text: str) -> bool:
+    lower = text.casefold()
+    action_markers = ("заказать", "закажи", "выбрать", "выбери")
+    non_goods_markers = ("встреч", "созвон", "звонок")
+    return any(action in lower for action in action_markers) and any(marker in lower for marker in non_goods_markers)
 
 
 def _strip_metadata_from_title(text: str, *, kind: str) -> str:

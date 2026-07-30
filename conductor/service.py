@@ -24,11 +24,11 @@ class ConductorService:
             settings.openai_transcribe_fallback_model,
         )
         self.notion = NotionClient(
-            settings.notion_token,
-            settings.notion_tasks_database_id,
-            settings.notion_study_database_id,
-            settings.notion_projects_database_id,
-            settings.notion_goods_database_id,
+            token=settings.notion_token,
+            tasks_db=settings.notion_tasks_database_id,
+            study_db=settings.notion_study_database_id,
+            projects_db=settings.notion_projects_database_id,
+            goods_db=settings.notion_goods_database_id,
         )
         self.telegram = TelegramClient(settings.telegram_bot_token)
         # A configured token is enough to enable the client. The dedicated
@@ -165,6 +165,9 @@ class ConductorService:
         created_tasks: list[str] = []
         created_studies: list[str] = []
         created_goods: list[str] = []
+        created_task_items: list[TaskItem] = []
+        created_study_items: list[StudyItem] = []
+        created_goods_items: list[GoodsItem] = []
         pending_count = 0
         errors: list[str] = []
 
@@ -178,6 +181,7 @@ class ConductorService:
             try:
                 url = self.notion.create_task(item, source=source, projects=projects)
                 created_tasks.append(url)
+                created_task_items.append(item)
                 if chat_id is not None:
                     self.recent.save(chat_id, _recent_payload("task", url, item.__dict__))
             except Exception as exc:  # noqa: BLE001 - notify user rather than hide automation failures.
@@ -193,6 +197,7 @@ class ConductorService:
             try:
                 url = self.notion.create_study(item)
                 created_studies.append(url)
+                created_study_items.append(item)
                 if chat_id is not None:
                     self.recent.save(chat_id, _recent_payload("study", url, item.__dict__))
             except Exception as exc:  # noqa: BLE001
@@ -208,6 +213,7 @@ class ConductorService:
             try:
                 url = self.notion.create_goods(item, projects=projects)
                 created_goods.append(url)
+                created_goods_items.append(item)
                 if chat_id is not None:
                     self.recent.save(chat_id, _recent_payload("goods", url, item.__dict__))
             except Exception as exc:  # noqa: BLE001
@@ -216,7 +222,13 @@ class ConductorService:
         if chat_id is not None and errors:
             self.telegram.send_message(chat_id, "\n".join(errors))
         if chat_id is not None and (created_tasks or created_studies or created_goods):
-            self.telegram.send_message(chat_id, _format_created_summary(classification, from_clarification=from_clarification))
+            created_classification = Classification(
+                tasks=created_task_items,
+                studies=created_study_items,
+                goods=created_goods_items,
+                notes=classification.notes,
+            )
+            self.telegram.send_message(chat_id, _format_created_summary(created_classification, from_clarification=from_clarification))
         return {
             "tasks_created": created_tasks,
             "studies_created": created_studies,

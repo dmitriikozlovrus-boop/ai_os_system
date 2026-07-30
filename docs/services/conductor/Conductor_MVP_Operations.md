@@ -101,7 +101,7 @@ python3 -m conductor.cli "Завтра напомни написать Марк�
 |---|---|
 | `Tasks` | `be9d26fe652b474696cd5de0118b1210` |
 | `Study / На изучение` | `4e27e10ca2bf44a08b4c8f86c7a125bd` |
-| `GOODS` | `33a5dafd-5ed3-4f55-b378-16db3571f3dc` |
+| `GOODS` | `e327cd54181f44ba883bb5a012dfd3d7` |
 | `Projects / Приоритеты` | `bbb501a6933941b4837afff250479f0e` |
 
 ## Важная логика MVP

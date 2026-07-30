@@ -75,7 +75,7 @@ class ModelsTest(unittest.TestCase):
                         "status": "Не куплено",
                         "goods_type": "Техника/электроника",
                         "priority": "P3",
-                        "price": 20000,
+                        "price": "20000",
                         "currency": "MXN",
                         "goods_user": "Работа",
                         "usage_place": "Офис",
@@ -388,6 +388,12 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result.goods[0].price, 20000.0)
         self.assertEqual(result.goods[0].currency, "MXN")
 
+    def test_fallback_does_not_create_goods_for_meeting_request(self):
+        client = OpenAIClient("", "unused", "unused")
+        result = client._fallback("Заказать встречу с Марко завтра", today="2026-05-20")
+        self.assertEqual(len(result.tasks), 1)
+        self.assertEqual(result.goods, [])
+
     def test_goods_unknown_enum_values_are_cleared(self):
         classification = classification_from_dict(
             {
@@ -516,6 +522,105 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(properties["Ссылка"], {"url": "https://example.com/laptop"})
         self.assertEqual(properties["Источник"], {"select": {"name": "ИИ"}})
 
+    def test_goods_notion_property_mapping_omits_empty_optional_properties(self):
+        item = GoodsItem(
+            title="  Ноутбук  ",
+            status=None,
+            goods_type=None,
+            priority=None,
+            price=None,
+            currency=None,
+            goods_user=None,
+            usage_place=None,
+            stream=None,
+            project=None,
+            url=None,
+            source=None,
+            confidence=0.9,
+            missing=[],
+        )
+        properties = _goods_properties(item)
+        self.assertEqual(properties["Наименование предмета"], {"title": [{"type": "text", "text": {"content": "Ноутбук"}}]})
+        self.assertEqual(properties["Статус"], {"status": {"name": "Не куплено"}})
+        self.assertEqual(properties["Источник"], {"select": {"name": "ИИ"}})
+        for name in (
+            "Тип товара",
+            "Приоритет",
+            "Цена",
+            "Валюта",
+            "Пользователь товара",
+            "Место использования",
+            "Стрим",
+            "Ссылка",
+            "Проект",
+        ):
+            self.assertNotIn(name, properties)
+
+    def test_create_goods_uses_configured_database_id(self):
+        client = NotionClient("token", "tasks", "study", "projects", "e327cd54181f44ba883bb5a012dfd3d7")
+        item = GoodsItem(
+            title="Ноутбук",
+            status="Не куплено",
+            goods_type=None,
+            priority=None,
+            price=None,
+            currency=None,
+            goods_user=None,
+            usage_place=None,
+            stream=None,
+            project=None,
+            url=None,
+            source="ИИ",
+            confidence=0.9,
+            missing=[],
+        )
+        with patch("conductor.notion_client.request_json", return_value={"url": "goods-url"}) as request_json:
+            self.assertEqual(client.create_goods(item, projects=[]), "goods-url")
+        payload = request_json.call_args.kwargs["payload"]
+        self.assertEqual(payload["parent"], {"database_id": "e327cd54181f44ba883bb5a012dfd3d7"})
+
+    def test_create_goods_requires_configured_database(self):
+        client = NotionClient("token", "tasks", "study", "projects")
+        item = GoodsItem(
+            title="Ноутбук",
+            status="Не куплено",
+            goods_type=None,
+            priority=None,
+            price=None,
+            currency=None,
+            goods_user=None,
+            usage_place=None,
+            stream=None,
+            project=None,
+            url=None,
+            source="ИИ",
+            confidence=0.9,
+            missing=[],
+        )
+        with self.assertRaisesRegex(RuntimeError, "NOTION_GOODS_DATABASE_ID"):
+            client.create_goods(item, projects=[])
+
+    def test_create_goods_requires_title(self):
+        client = NotionClient("token", "tasks", "study", "projects", "goods")
+        item = GoodsItem(
+            title=" ",
+            status="Не куплено",
+            goods_type=None,
+            priority=None,
+            price=None,
+            currency=None,
+            goods_user=None,
+            usage_place=None,
+            stream=None,
+            project=None,
+            url=None,
+            source="ИИ",
+            confidence=0.9,
+            missing=[],
+        )
+        with self.assertRaisesRegex(RuntimeError, "Goods title is required"):
+            client.create_goods(item, projects=[])
+
     def test_goods_notion_error_does_not_break_task_or_study(self):
         service = object.__new__(ConductorService)
         service.settings = Mock(confidence_threshold=0.70)
@@ -582,6 +687,61 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(result["studies_created"], ["study-url"])
         self.assertEqual(result["goods_created"], [])
         self.assertIn("Не удалось создать товар", result["errors"][0])
+
+    def test_goods_failure_summary_only_mentions_created_entities(self):
+        service = object.__new__(ConductorService)
+        service.settings = Mock(confidence_threshold=0.70)
+        service.notion = Mock()
+        service.notion.create_task.return_value = "task-url"
+        service.notion.create_goods.side_effect = RuntimeError("notion goods failed")
+        service.telegram = Mock()
+        service.recent = Mock()
+        classification = classification_from_dict(
+            {
+                "tasks": [
+                    {
+                        "title": "Написать Марко",
+                        "description": "Написать Марко",
+                        "desired_result": "Отправленное письмо",
+                        "project": "Общее",
+                        "area": "Прочее",
+                        "due_date": "2026-05-21",
+                        "effort_minutes": 15,
+                        "priority": "P2",
+                        "next_step": "Написать Марко",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "studies": [],
+                "goods": [
+                    {
+                        "title": "Ноутбук",
+                        "status": "Не куплено",
+                        "goods_type": None,
+                        "priority": None,
+                        "price": None,
+                        "currency": None,
+                        "goods_user": None,
+                        "usage_place": None,
+                        "stream": None,
+                        "project": None,
+                        "url": None,
+                        "source": "ИИ",
+                        "confidence": 0.9,
+                        "missing": [],
+                    }
+                ],
+                "notes": [],
+            }
+        )
+        result = service._handle_classification(classification, chat_id=42, source="Telegram", projects=[])
+        messages = [call.args[1] for call in service.telegram.send_message.call_args_list]
+        self.assertEqual(result["tasks_created"], ["task-url"])
+        self.assertEqual(result["goods_created"], [])
+        self.assertIn("Не удалось создать товар 'Ноутбук'", messages[0])
+        self.assertIn("Добавила задачу: Написать Марко", messages[1])
+        self.assertNotIn("Создан товар", messages[1])
 
     def test_edit_request_without_pending_returns_guidance(self):
         service = object.__new__(ConductorService)
