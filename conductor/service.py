@@ -62,6 +62,7 @@ from .feedback_backlog import (
     priority_recommendation,
     signal_payload,
 )
+from .feedback_pipeline import choose_system_issue_duplicate, repeat_solution_text
 from .interactions import InteractionStore
 from .integration_validation import validate_feedback_backlog_schema, validate_openai_contracts
 from .models import (
@@ -975,10 +976,31 @@ class ConductorService:
                         issue_url = ""
                         self._send_message(chat_id, "Этот feedback уже зафиксирован. Дубликат System Issue не создаю.")
                     else:
-                        self._assert_write_allowed("create_system_issue")
-                        issue_url = self.notion.create_system_issue(issue)
-                        self._record_write_completed()
-                        self.interactions.remember_issue_fingerprint(issue.fingerprint)
+                        duplicate = self._find_system_issue_duplicate(issue)
+                        if duplicate.action == "UPDATE_EXISTING" and duplicate.matched_issue:
+                            self._assert_write_allowed("update_system_issue_repeat")
+                            issue_url = duplicate.matched_issue.url
+                            self.notion.update_system_issue(
+                                duplicate.matched_issue.page_id,
+                                solution=repeat_solution_text(
+                                    duplicate.matched_issue,
+                                    issue,
+                                    feedback=feedback,
+                                    today=date.today().isoformat(),
+                                ),
+                                status="В анализе",
+                            )
+                            self._record_write_completed()
+                            self.interactions.remember_issue_fingerprint(issue.fingerprint)
+                            self._send_message(
+                                chat_id,
+                                f"Нашла существующую System Issue и обновила повтор.\n\nПохожесть: {duplicate.score}/100.",
+                            )
+                        else:
+                            self._assert_write_allowed("create_system_issue")
+                            issue_url = self.notion.create_system_issue(issue)
+                            self._record_write_completed()
+                            self.interactions.remember_issue_fingerprint(issue.fingerprint)
                 except Exception as exc:  # noqa: BLE001
                     print(f"FEEDBACK_BACKLOG_ERROR state=system_issue_create: {exc}", flush=True)
                     self._send_message(chat_id, f"Не смогла сохранить feedback в SYSTEM ISSUES: {_safe_error(exc)}")
@@ -1052,6 +1074,26 @@ class ConductorService:
         print(f"FEEDBACK_NEW_IMPROVEMENT_PROPOSED feedback_kind={feedback.feedback_kind} state=awaiting_new_improvement_confirmation", flush=True)
         self._send_message(chat_id, _format_backlog_new_offer(feedback, recommendation))
         return {"tasks_created": [], "studies_created": [], "goods_created": [], "pending": 0, "errors": [], "notes": ["feedback new improvement proposed"], "issue_url": issue_url}
+
+    def _find_system_issue_duplicate(self, issue: SystemIssueRecord):
+        try:
+            candidates = self.notion.list_recent_system_issues(
+                issue_type=issue.classification.issue_type,
+                database=issue.classification.database,
+                days=180,
+                limit=50,
+            )
+            if not isinstance(candidates, list):
+                candidates = []
+        except Exception as exc:  # noqa: BLE001 - duplicate lookup must not block issue capture.
+            print(f"FEEDBACK_BACKLOG_ERROR state=system_issue_duplicate_lookup: {exc}", flush=True)
+            candidates = []
+        decision = choose_system_issue_duplicate(issue, candidates)
+        print(
+            f"SYSTEM_ISSUE_DUPLICATE_DECISION action={decision.action} score={decision.score} candidate={getattr(decision.matched_issue, 'page_id', '')}",
+            flush=True,
+        )
+        return decision
 
     def _create_backlog_improvement(self, chat_id: int, feedback_state: dict[str, Any]) -> dict[str, Any]:
         feedback = NormalizedFeedback(**feedback_state["normalized_feedback"])
