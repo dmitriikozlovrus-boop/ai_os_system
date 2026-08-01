@@ -4,6 +4,7 @@ import re
 from datetime import date
 from typing import Any
 
+from .feedback_pipeline import context_snapshot_text, recover_feedback_context
 from .models import BacklogPriorityRecommendation, ImprovementSummary, NormalizedFeedback, SystemIssueClassification, SystemIssueRecord
 
 
@@ -115,6 +116,7 @@ def build_feedback_system_issue(
     corrected: bool = False,
 ) -> SystemIssueRecord:
     context = interaction or {}
+    snapshot = recover_feedback_context(context, route_trace=["feedback_backlog", "build_system_issue"])
     input_data = str(context.get("input_text") or "").strip() or "Не определено: feedback без привязки к конкретному interaction."
     description = "\n".join(
         [
@@ -122,6 +124,7 @@ def build_feedback_system_issue(
             f"Нормализованное описание: {feedback.normalized_description}",
             f"Фактическое поведение: {feedback.actual_behavior or 'Не определено'}",
             f"Ожидаемое поведение: {feedback.expected_behavior or 'Не определено'}",
+            f"Технический контекст: {context_snapshot_text(snapshot)}",
             f"Контекст interaction: {_interaction_context_summary(context)}",
         ]
     )
@@ -317,11 +320,39 @@ def _is_concrete_error(text: str) -> bool:
         return True
     if _is_general_problem(text) and "создала запись" in text and not any(marker in text for marker in ("неправильно", "ошибка", "не та база", "не в той базе", "неверная дата", "не тот проект", "дубликат", "фигн")):
         return False
-    return any(marker in text for marker in ("неправильно", "ошибка", "не та база", "не в той базе", "неверная дата", "не тот проект", "дубликат", "фигн", "создала запись"))
+    return any(
+        marker in text
+        for marker in (
+            "неправильно",
+            "ошибка",
+            "не та база",
+            "не в той базе",
+            "неверная дата",
+            "не тот проект",
+            "дубликат",
+            "фигн",
+            "создала запись",
+            "не туда",
+            "не спрос",
+            "ерунд",
+            "не то сделал",
+        )
+    )
 
 
 def _is_ambiguous(text: str) -> bool:
-    return text in {"опять неправильно", "снова неправильно", "неправильно", "ошибка", "не так"}
+    return text in {
+        "опять неправильно",
+        "снова неправильно",
+        "неправильно",
+        "ошибка",
+        "не так",
+        "опять не понял",
+        "вообще не то сделал",
+        "все снова сломалось",
+        "всё снова сломалось",
+        "не туда записалось",
+    }
 
 
 def _problem_title(text: str, *, recurring: bool) -> str:
@@ -331,6 +362,12 @@ def _problem_title(text: str, *, recurring: bool) -> str:
         return "Дата неверно определяется или теряется"
     if "проект" in text:
         return "Проект неверно определяется"
+    if "не спрос" in text:
+        return "Не запрошено нужное уточнение"
+    if "ерунд" in text:
+        return "AI предложил некачественное решение"
+    if "не туда" in text:
+        return "Запись обработана не в том направлении"
     if "дубликат" in text or "дубли" in text:
         return "Создаются дубли записей"
     if "баз" in text:
