@@ -28,5 +28,15 @@
   {"text": "Не так", "expected_kind": "UNKNOWN", "system_issue": false, "improvement": false, "clarification": true, "interaction": null},
   {"text": "Ниправильная дата", "expected_kind": "NOT_FEEDBACK", "system_issue": false, "improvement": false, "clarification": false, "interaction": null},
   {"text": "Не создавай дубликаты задач", "expected_kind": "IMPROVEMENT_IDEA", "system_issue": false, "improvement": true, "clarification": false, "interaction": null},
-  {"text": "Снова неверный проект у задачи", "expected_kind": "GENERAL_PROBLEM", "system_issue": false, "improvement": true, "clarification": false, "interaction": null}
+  {"text": "Снова неверный проект у задачи", "expected_kind": "GENERAL_PROBLEM", "system_issue": false, "improvement": true, "clarification": false, "interaction": null},
+  {"text": "ИИ опять предложил ерунду", "expected_kind": "CONCRETE_ERROR", "system_issue": true, "improvement": true, "clarification": false, "interaction": null},
+  {"text": "Опять не спросила уточнение", "expected_kind": "CONCRETE_ERROR", "system_issue": true, "improvement": true, "clarification": false, "interaction": null},
+  {"text": "Все снова сломалось", "expected_kind": "UNKNOWN", "system_issue": false, "improvement": false, "clarification": true, "interaction": null},
+  {"text": "Не туда записалось", "expected_kind": "UNKNOWN", "system_issue": false, "improvement": false, "clarification": true, "interaction": null},
+  {"text": "Нужно было создать Problem", "expected_kind": "IMPROVEMENT_IDEA", "system_issue": false, "improvement": true, "clarification": false, "interaction": null},
+  {"text": "Не спросила уточнение по проекту", "expected_kind": "CONCRETE_ERROR", "system_issue": true, "improvement": true, "clarification": false, "interaction": {"interaction_id": "r12", "input_text": "Позвонить"}},
+  {"text": "ИИ предложил ерунду вместо нормального решения", "expected_kind": "CONCRETE_ERROR", "system_issue": true, "improvement": true, "clarification": false, "interaction": {"interaction_id": "r13", "input_text": "Разобрать ошибку"}},
+  {"text": "Не туда записалось, это должна быть задача", "expected_kind": "CONCRETE_ERROR", "system_issue": true, "improvement": true, "clarification": false, "interaction": {"interaction_id": "r14", "input_text": "Купить лампу"}},
+  {"text": "Опять не понял", "expected_kind": "UNKNOWN", "system_issue": false, "improvement": false, "clarification": true, "interaction": null},
+  {"text": "Вообще не то сделал", "expected_kind": "UNKNOWN", "system_issue": false, "improvement": false, "clarification": true, "interaction": null}
 ]
